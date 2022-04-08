@@ -11,11 +11,11 @@
 #include <netinet/in.h>  
 #include <arpa/inet.h> 
 
-#include "queue.h"
+#include "share_queue.h"
 #include "share.h" 
   
 #define BUF_SIZE 100
-#define ROUND_TIME 100000000
+#define ROUND_TIME 1
 
 // print char array in hex
 void my_print_hex(char *m, int length){
@@ -30,7 +30,7 @@ ssize_t my_recv(int sockfd, void *buf, size_t len, int flags){
 
     if(pthread_mutex_lock(response_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t count = 0;
-    buffer *b = dequeue(shm_ptr, response_queue, len);
+    buffer *b = share_dequeue(shm_ptr, response_queue, len);
     if(b->buf != NULL){
         memcpy(buf+count, b->buf, b->length *sizeof(char));
         count = b->length;
@@ -47,7 +47,7 @@ ssize_t my_send(int sockfd, const void *buf, size_t len, int flags){
 
     if(pthread_mutex_lock(request_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t count = 0;
-    count = enqueue(shm_ptr, request_queue, (char *)buf, len);
+    count = share_enqueue(shm_ptr, request_queue, (char *)buf, len);
     if(pthread_mutex_unlock(request_lock) != 0) perror("pthread_mutex_unlock failed");
 
     return count;
@@ -67,10 +67,10 @@ __attribute__((constructor)) void init(){
         perror("mmap failed");
     }
 
-    request_queue = (queue *)shm_ptr;
-    response_queue = (queue *)(shm_ptr+sizeof(queue));
-    request_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(queue));
-    response_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(queue)+sizeof(pthread_mutex_t));
+    request_queue = (share_queue *)shm_ptr;
+    response_queue = (share_queue *)(shm_ptr+sizeof(share_queue));
+    request_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(share_queue));
+    response_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(share_queue)+sizeof(pthread_mutex_t));
 }
 
 int main()  

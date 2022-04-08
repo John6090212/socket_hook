@@ -1,22 +1,18 @@
-#define QUEUE_CAPACITY 15000
-#define min(a,b)(a<b?a:b)
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-typedef struct queue queue;
-typedef struct buffer buffer;
+typedef struct Queue Queue;
 
-struct queue {
-    int front, rear, capacity, current_size;
-    // data start offset
-    int message_start_offset;
+// A structure to represent a queue
+struct Queue {
+    int front, rear, size;
+    unsigned capacity;
+    int* array;
 };
 
-struct buffer {
-    char *buf;
-    int length;
-};
-
-queue *request_queue;
-queue *response_queue;
-
-int enqueue(void *shm, queue *q, char *c, int len);
-buffer *dequeue(void *shm, queue *q, int len);
+struct Queue* createQueue(unsigned capacity);
+int isFull(struct Queue* queue);
+int isEmpty(struct Queue* queue);
+int enqueue(struct Queue* queue, int item);
+int dequeue(struct Queue* queue);
