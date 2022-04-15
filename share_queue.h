@@ -1,8 +1,15 @@
-#define QUEUE_CAPACITY 15000
-#define min(a,b)(a<b?a:b)
+#ifndef _SHARE_QUEUE_H_
+#define _SHARE_QUEUE_H_
+
+#define STREAM_QUEUE_CAPACITY 30080
+#define DATAGRAM_QUEUE_CAPACITY 20
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+#define MESSAGE_MAX_LENGTH 1500
 
 typedef struct share_queue share_queue;
 typedef struct buffer buffer;
+typedef struct message_t message_t;
 
 struct share_queue {
     int front, rear, capacity, current_size;
@@ -15,8 +22,17 @@ struct buffer {
     int length;
 };
 
-share_queue *request_queue;
-share_queue *response_queue;
+// for datagram
+struct message_t {
+    int length;
+    char buf[MESSAGE_MAX_LENGTH];
+};
 
-int share_enqueue(void *shm, share_queue *q, char *c, int len);
-buffer *share_dequeue(void *shm, share_queue *q, int len);
+int stream_enqueue(void *shm, share_queue *q, char *c, int len);
+buffer *stream_dequeue(void *shm, share_queue *q, int len);
+
+// for datagram
+int datagram_enqueue(void *shm, share_queue *q, message_t m);
+message_t *datagram_dequeue(void *shm, share_queue *q);
+
+#endif

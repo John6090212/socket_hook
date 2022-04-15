@@ -1,3 +1,6 @@
+#ifndef _QUEUE_H_
+#define _QUEUE_H_
+
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,3 +19,5 @@ int isFull(struct Queue* queue);
 int isEmpty(struct Queue* queue);
 int enqueue(struct Queue* queue, int item);
 int dequeue(struct Queue* queue);
+
+#endif

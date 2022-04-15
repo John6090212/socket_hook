@@ -11,7 +11,7 @@ void print_hex(char *m, int length){
     printf("\n");
 }
 
-int share_enqueue(void *shm, share_queue *q, char *c, int len){
+int stream_enqueue(void *shm, share_queue *q, char *c, int len){
     char *m_arr = (char *)(shm+q->message_start_offset);
 
     // queue is full
@@ -26,21 +26,21 @@ int share_enqueue(void *shm, share_queue *q, char *c, int len){
         q->front = q->rear = 0;
         memcpy(&m_arr[q->rear], c, add_len*sizeof(char));
         q->rear = (add_len - 1) % q->capacity;
-        q->current_size += add_len;
     }
     // normal condition
     else{
         q->rear = (q->rear + 1) % q->capacity;
         memcpy(&m_arr[q->rear], c, add_len*sizeof(char));
         q->rear = (q->rear + add_len - 1) % q->capacity;
-        q->current_size += add_len;
+        
     }
+    q->current_size += add_len;
 
     return add_len;
 }
 
 // need to free buffer and char*
-buffer *share_dequeue(void *shm, share_queue *q, int len){
+buffer *stream_dequeue(void *shm, share_queue *q, int len){
     char *m_arr = (char *)(shm+q->message_start_offset);
 
     int sub_len = min((q->current_size), len);
@@ -71,6 +71,51 @@ buffer *share_dequeue(void *shm, share_queue *q, int len){
     b->length = sub_len;
 
     return b;
+}
+
+int datagram_enqueue(void *shm, share_queue *q, message_t m){
+    message_t *m_arr = (message_t *)(shm+q->message_start_offset);
+    // queue is full
+    if (q->current_size == q->capacity){
+        return -1;
+    }
+    // queue is empty
+    if(q->front == -1){
+        q->front = q->rear = 0;
+        memcpy(&m_arr[q->rear], &m, sizeof(message_t));
+    }
+    // normal condition
+    else{
+        q->rear = (q->rear + 1) % q->capacity;
+        memcpy(&m_arr[q->rear], &m, sizeof(message_t));
+    }
+    q->current_size++;
+
+    return 0;
+}
+
+message_t *datagram_dequeue(void *shm, share_queue *q){
+    message_t *m_arr = (message_t *)(shm+q->message_start_offset);
+    message_t *m = (message_t *)malloc(sizeof(message_t));
+    if(q->front == -1){
+        m->length = 0;
+        return m;
+    }
+    
+    memcpy(m, &m_arr[q->front], sizeof(message_t));
+    m_arr[q->front].length = 0;
+    // reset front and rear if queue becomes empty
+    if(q->front == q->rear){
+        q->front = -1;
+        q->rear = -1;
+    }
+    // normal condition
+    else
+        q->front = (q->front + 1) % q->capacity;
+    
+    q->current_size--;
+
+    return m;    
 }
 
 // need to fix later

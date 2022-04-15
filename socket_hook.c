@@ -21,10 +21,14 @@
 #include <errno.h>
 // get random port number
 #include <time.h>
+// ceil
+#include <math.h>
 #include "share_queue.h"
-#include "share.h"
 #include "queue.h"
 #include "socket.h"
+
+// share queue number in share memory, an upper bound of max connections at a time of server
+#define SOCKET_NUM 30
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -40,8 +44,89 @@ ssize_t (*original_send)(int, const void *, size_t, int);
 int (*original_socketpair)(int, int, int, int [2]);
 int (*original_getpeername)(int, struct sockaddr *, socklen_t *);
 
+// for share memory
+int shm_fd;
+void *shm_ptr;
+
+typedef struct share_unit share_unit;
+struct share_unit {
+    share_queue request_queue;
+    share_queue response_queue;
+    pthread_mutex_t request_lock;
+    pthread_mutex_t response_lock;
+    char request_buf[STREAM_QUEUE_CAPACITY];
+    char response_buf[STREAM_QUEUE_CAPACITY];
+};
+
 // queue to acquire available fd
 Queue *available_fd;
+// queue to acquire available share_unit
+Queue *available_share_unit;
+
+// for debug
+void my_print_hex(char *m, int length){
+    for(int i = 0; i < length; i++){
+        printf("%02x", m[i]);
+    }
+    printf("\n");
+}
+
+void init_share_queue(int i){
+    //initialize mutex attr
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    //lock owner dies without unlocking it, any future attempts to acquire lock on this mutex will succeed
+    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+
+    share_queue req_queue = (share_queue){
+        .front = -1,
+        .rear = -1,
+        .capacity = STREAM_QUEUE_CAPACITY,
+        .current_size = 0,
+        .message_start_offset = (i+1)*2*sizeof(share_queue)+(i+1)*2*sizeof(pthread_mutex_t)+i*2*STREAM_QUEUE_CAPACITY
+    };
+    memcpy(shm_ptr+i*sizeof(share_unit), &req_queue, sizeof(share_queue));
+
+    share_queue res_queue = (share_queue){
+        .front = -1,
+        .rear = -1,
+        .capacity = STREAM_QUEUE_CAPACITY,
+        .current_size = 0,
+        .message_start_offset = (i+1)*2*sizeof(share_queue)+(i+1)*2*sizeof(pthread_mutex_t)+(i*2+1)*STREAM_QUEUE_CAPACITY
+    };
+    memcpy(shm_ptr+i*sizeof(share_unit)+sizeof(share_queue), &res_queue, sizeof(share_queue));
+    
+    pthread_mutex_t *request_lock = (pthread_mutex_t *)(shm_ptr+i*sizeof(share_unit)+2*sizeof(share_queue));
+    if(pthread_mutex_init(request_lock, &attr) != 0) perror("pthread_mutex_init");
+
+    pthread_mutex_t *response_lock = (pthread_mutex_t *)(shm_ptr+i*sizeof(share_unit)+2*sizeof(share_queue)+sizeof(pthread_mutex_t));
+    if(pthread_mutex_init(response_lock, &attr) != 0) perror("pthread_mutex_init");
+}
+
+int init_socket(int fd, int domain, int type, int protocol){
+    socket_arr[fd] = (mysocket){
+        .domain = domain,
+        .type = type,
+        .protocol = protocol,
+        .has_bind = 0,
+        .in_use = 1,
+        .is_shutdown = 0,
+        .msg_more_buf = NULL,
+        .msg_more_size = 0,
+        .share_unit_index = -1
+    };
+    socket_arr[fd].share_unit_index = dequeue(available_share_unit);
+    if(socket_arr[fd].share_unit_index == INT_MIN){
+        printf("need to increase SOCK_NUM\n");
+        return -1;
+    }
+    socket_arr[fd].request_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_queue);
+    socket_arr[fd].response_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_queue);
+    socket_arr[fd].request_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_lock);
+    socket_arr[fd].response_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_lock);
+    return 0;
+}
 
 __attribute__((constructor)) void init(){
     // initialize function pointer before main function
@@ -60,8 +145,14 @@ __attribute__((constructor)) void init(){
 
     // initialize available fd queue
     available_fd = createQueue(1024);
-    for(int i = 3; i <=1023; i++){
+    for(int i = 0; i <=1023; i++){
         enqueue(available_fd, i);
+    }
+
+    // initialize available share unit queue
+    available_share_unit = createQueue(SOCKET_NUM);
+    for(int i = 0; i < SOCKET_NUM; i++){
+        enqueue(available_share_unit, i);
     }
 
     // initialize socket array
@@ -83,43 +174,14 @@ __attribute__((constructor)) void init(){
         perror("mmap failed");
     }
 
-    // initialize queue
-    share_queue req_queue = (share_queue){
-        .front = -1,
-        .rear = -1,
-        .capacity = QUEUE_CAPACITY,
-        .current_size = 0,
-        .message_start_offset = 2*sizeof(share_queue)+2*sizeof(pthread_mutex_t)
-    };
-    memcpy(shm_ptr, &req_queue, sizeof(share_queue));
-    request_queue = (share_queue *)shm_ptr;
-
-    share_queue res_queue = (share_queue){
-        .front = -1,
-        .rear = -1,
-        .capacity = QUEUE_CAPACITY,
-        .current_size = 0,
-        .message_start_offset = 2*sizeof(share_queue)+2*sizeof(pthread_mutex_t)+QUEUE_CAPACITY
-    };
-    memcpy(shm_ptr+sizeof(share_queue), &res_queue, sizeof(share_queue));
-    response_queue = (share_queue *)(shm_ptr+sizeof(share_queue));
-
-    //initialize mutex
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    //lock owner dies without unlocking it, any future attempts to acquire lock on this mutex will succeed
-    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-
-    request_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(share_queue));
-    pthread_mutex_init(request_lock, &attr);
- 
-    response_lock = (pthread_mutex_t *)(shm_ptr+2*sizeof(share_queue)+sizeof(pthread_mutex_t));
-    pthread_mutex_init(response_lock, &attr);
+    // initialize request/response queue
+    for(int i = 0; i < SOCKET_NUM; i++){
+        init_share_queue(i);
+    }
 }
 
 int is_valid_fd(int sockfd){
-    if(sockfd >= 3 && sockfd <= 1023 && socket_arr[sockfd].in_use == 1)
+    if(sockfd >= 0 && sockfd <= 1023 && socket_arr[sockfd].in_use == 1)
         return 1;
     else
         return 0;
@@ -132,13 +194,9 @@ int socket(int domain, int type, int protocol){
         errno = EMFILE;
         return -1;
     }
-    socket_arr[fd] = (mysocket){
-        .domain = domain,
-        .type = type,
-        .protocol = protocol,
-        .has_bind = 0,
-        .in_use = 1
-    };
+    if (init_socket(fd, domain, type, protocol) == -1)
+        return -1;
+
     // return original_socket(domain, type, protocol);
     return fd;
 }
@@ -181,13 +239,8 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
             errno = EMFILE;
             return -1;
         }
-        socket_arr[fd] = (mysocket){
-            .domain = socket_arr[sockfd].domain,
-            .type = socket_arr[sockfd].type,
-            .protocol = socket_arr[sockfd].protocol,
-            .has_bind = 0,
-            .in_use = 1
-        };
+        if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
+            return -1;
 
         struct sockaddr_in *fake_addr = (struct sockaddr_in *) addr;
         struct in_addr net_addr;
@@ -225,6 +278,8 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
 int close(int fd){
     printf("hook close()!\n");
     if(is_valid_fd(fd)){
+        initialize_share_queue(socket_arr[fd].share_unit_index);
+        enqueue(available_share_unit, socket_arr[fd].share_unit_index);
         memset(&socket_arr[fd], 0, sizeof(mysocket));
         enqueue(available_fd, fd);
     }
@@ -264,42 +319,213 @@ int getsockname(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict 
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags){
+    if(!is_valid_fd(sockfd)){
+        errno = EBADF;
+        return -1;
+    }
     // handle nonblocking flag
     if(flags & MSG_DONTWAIT){
-        if(request_queue->current_size == 0){
+        if(socket_arr[sockfd].request_queue->current_size == 0){
             errno = EWOULDBLOCK;
             return -1;
         }
     }
-    while(request_queue->current_size == 0);
-
-    if(pthread_mutex_lock(request_lock) != 0) perror("pthread_mutex_lock failed");
+    
     ssize_t count = 0;
-    buffer *b = share_dequeue(shm_ptr, request_queue, len);
-    if(b->buf != NULL){
-        memcpy(buf+count, b->buf, b->length *sizeof(char));
-        count = b->length;
-        free(b->buf); 
+    // while loop for MSG_WAITALL
+    while(count != len){
+        while(socket_arr[sockfd].request_queue->current_size == 0);
+
+        if(pthread_mutex_lock(socket_arr[sockfd].request_lock) != 0) perror("pthread_mutex_lock failed");
+        if(socket_arr[sockfd].domain == AF_INET && socket_arr[sockfd].type == SOCK_STREAM){
+            if(flags & MSG_PEEK){
+                char *m_arr = (char *)(shm_ptr+socket_arr[sockfd].request_queue->message_start_offset);
+                memcpy(buf+count, &m_arr[socket_arr[sockfd].request_queue->front], min(socket_arr[sockfd].request_queue->current_size,len-count)*sizeof(char));
+                count += min(socket_arr[sockfd].request_queue->current_size,len-count);
+            }
+            else{
+                buffer *b = stream_dequeue(shm_ptr, socket_arr[sockfd].request_queue, len-count);
+                if(b->buf != NULL){
+                    // tcp will discard the received byte, rather than save in buffer
+                    if(!(flags & MSG_TRUNC)){
+                        memcpy(buf+count, b->buf, b->length *sizeof(char));
+                    }
+                    count += b->length;
+                    free(b->buf);
+                }
+                free(b);
+            }
+        }
+        // in other case, MSG_TRUNC return the real length of the packet and discard the oversized part
+        else if(socket_arr[sockfd].domain == AF_INET && socket_arr[sockfd].type == SOCK_DGRAM){
+            message_t *m = datagram_dequeue(shm_ptr, socket_arr[sockfd].request_queue);
+            if(m->length != 0){
+                memcpy(buf, m->buf, min(len,m->length));
+                count = m->length;
+            }
+            free(m);
+        }
+        else{
+            printf("not implement socket type in recv!");
+            exit(777);
+        }
+        if(pthread_mutex_unlock(socket_arr[sockfd].request_lock) != 0) perror("pthread_mutex_unlock failed");
+        // skip if no MSG_WAITALL or socket type is datagram (MSG_WAITALL has no effect)
+        if(!(flags & MSG_WAITALL) | socket_arr[sockfd].type == SOCK_DGRAM) break;
     }
-    free(b);
-    if(pthread_mutex_unlock(request_lock) != 0) perror("pthread_mutex_unlock failed");
 
     return count;
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags){
-    while(response_queue->current_size == response_queue->capacity);
+    if(!is_valid_fd(sockfd)){
+        errno = EBADF;
+        return -1;
+    }
+    // handle nonblocking flag
+    if(flags & MSG_DONTWAIT){
+        if(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity){
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+    }
+    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
 
-    if(pthread_mutex_lock(response_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t count = 0;
-    count = share_enqueue(shm_ptr, response_queue, (char *)buf, len);
-    if(pthread_mutex_unlock(response_lock) != 0) perror("pthread_mutex_unlock failed");
+    if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_lock failed");
+    if(socket_arr[sockfd].domain == AF_INET && socket_arr[sockfd].type == SOCK_STREAM){
+        if((flags & MSG_MORE) && (socket_arr[sockfd].msg_more_size + len < LO_MSS)){
+            // save stream in temporary buffer
+            if(socket_arr[sockfd].msg_more_buf == NULL){
+                socket_arr[sockfd].msg_more_buf = malloc(len*sizeof(char));
+                socket_arr[sockfd].msg_more_size = len;
+                memcpy(socket_arr[sockfd].msg_more_buf, buf, len);
+                count = len;
+            }
+            // temporary buffer already exist
+            else{
+                socket_arr[sockfd].msg_more_buf = realloc(socket_arr[sockfd].msg_more_buf, (socket_arr[sockfd].msg_more_size+len)*sizeof(char));
+                memcpy(socket_arr[sockfd].msg_more_buf+socket_arr[sockfd].msg_more_size, buf, len);
+                socket_arr[sockfd].msg_more_size += len;
+                count = len;
+            }
+        }
+        // temporary buffer length might exceed MSS, force to send stream
+        else if(socket_arr[sockfd].msg_more_buf != NULL){
+            int total_len = socket_arr[sockfd].msg_more_size + len;
+            int send_times = (int)(total_len / LO_MSS) + 1;
+            char *temp_buf = malloc(total_len*sizeof(char));
+            memcpy(temp_buf, socket_arr[sockfd].msg_more_buf, socket_arr[sockfd].msg_more_size);
+            memcpy(temp_buf+socket_arr[sockfd].msg_more_size, buf, len);
+
+            int temp_count = 0;
+            for(int i = 0; i < send_times; i++){
+                if(i == 0){
+                    temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, temp_buf, min(total_len,LO_MSS));
+                    if(temp_count >= 0)
+                        count = max((temp_count - socket_arr[sockfd].msg_more_size), 0);
+                    if(send_times == 1){
+                        if(temp_count < 0)
+                            count = temp_count;
+                        break;
+                    }    
+                }
+                else{
+                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
+
+                    if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_lock failed");
+                    if(i == send_times - 1) 
+                        temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, temp_buf+i*LO_MSS, total_len-i*LO_MSS);                   
+                    else 
+                        temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, temp_buf+i*LO_MSS, LO_MSS);
+                    
+                    if(temp_count > 0)
+                        count += temp_count;
+                }                
+
+                if(i != send_times - 1){
+                    if(pthread_mutex_unlock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_unlock failed");
+                }             
+            }
+            // clean temporary buffer
+            free(socket_arr[sockfd].msg_more_buf);
+            socket_arr[sockfd].msg_more_buf = NULL;
+            socket_arr[sockfd].msg_more_size = 0;
+            free(temp_buf);
+        }
+        // no temporary buffer
+        else{
+            int send_times = (int)(len / LO_MSS) + 1;
+            int temp_count = 0;
+            for(int i = 0; i < send_times; i++){
+                if(i == 0){
+                    temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, (char *)buf, min(len,LO_MSS));
+                    if(temp_count > 0)
+                        count = temp_count;
+                    if(send_times == 1){
+                        if(temp_count < 0)
+                            count = temp_count;
+                        break;
+                    }   
+                }
+                else{
+                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
+
+                    if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_lock failed");
+                    if(i == send_times - 1) 
+                        temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, (char *)buf+i*LO_MSS, len-i*LO_MSS);                   
+                    else 
+                        temp_count = stream_enqueue(shm_ptr, socket_arr[sockfd].response_queue, (char *)buf+i*LO_MSS, LO_MSS);
+                    
+                    if(temp_count > 0)
+                        count += temp_count;
+                }                
+
+                if(i != send_times - 1){
+                    if(pthread_mutex_unlock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_unlock failed");
+                }             
+            }
+        }
+    }
+    else if(socket_arr[sockfd].domain == AF_INET && socket_arr[sockfd].type == SOCK_DGRAM){
+        message_t m = {
+            .length = len,
+        };
+        memcpy(m.buf, buf, len);
+        if(datagram_enqueue(shm_ptr, socket_arr[sockfd].response_queue, m) == 0)
+            count = len;
+    }
+    else{
+        printf("not implement socket type in send!");
+        exit(777);
+    }
+    if(pthread_mutex_unlock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_unlock failed");
     
     return count;
 }
 
 int socketpair(int domain, int type, int protocol, int sv[2]){
     printf("hook socketpair()!\n");
+    int fd1 = dequeue(available_fd);
+    if(fd1 == INT_MIN){
+        errno = EMFILE;
+        return -1;
+    }
+    if (init_socket(fd1, domain, type, protocol) == -1)
+        return -1;
+
+    int fd2 = dequeue(available_fd);
+    if(fd2 == INT_MIN){
+        memset(&socket_arr[fd1], 0, sizeof(mysocket));
+        enqueue(available_fd, fd1);
+        errno = EMFILE;
+        return -1;
+    }
+    if (init_socket(fd2, domain, type, protocol) == -1)
+        return -1;
+
+    sv[0] = fd1;
+    sv[1] = fd2; 
     // return original_socketpair(domain, type, protocol, sv);
     return 0;
 }
