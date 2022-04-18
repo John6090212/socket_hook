@@ -1,8 +1,6 @@
 #ifndef _SHARE_QUEUE_H_
 #define _SHARE_QUEUE_H_
 
-#define STREAM_QUEUE_CAPACITY 30080
-#define DATAGRAM_QUEUE_CAPACITY 20
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
 #define MESSAGE_MAX_LENGTH 1500

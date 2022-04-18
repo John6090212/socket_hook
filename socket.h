@@ -2,7 +2,7 @@
 #define _SOCKET_H_
 
 #include <pthread.h>
-#include "queue.h"
+#include "share_queue.h"
 typedef struct mysocket mysocket;
 #define LO_MSS 65496
 
@@ -32,5 +32,4 @@ struct mysocket {
     pthread_mutex_t *response_lock;
 };
 
-mysocket socket_arr[1024];
 #endif

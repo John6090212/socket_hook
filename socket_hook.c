@@ -26,9 +26,7 @@
 #include "share_queue.h"
 #include "queue.h"
 #include "socket.h"
-
-// share queue number in share memory, an upper bound of max connections at a time of server
-#define SOCKET_NUM 30
+#include "share.h"
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -44,24 +42,12 @@ ssize_t (*original_send)(int, const void *, size_t, int);
 int (*original_socketpair)(int, int, int, int [2]);
 int (*original_getpeername)(int, struct sockaddr *, socklen_t *);
 
-// for share memory
-int shm_fd;
-void *shm_ptr;
-
-typedef struct share_unit share_unit;
-struct share_unit {
-    share_queue request_queue;
-    share_queue response_queue;
-    pthread_mutex_t request_lock;
-    pthread_mutex_t response_lock;
-    char request_buf[STREAM_QUEUE_CAPACITY];
-    char response_buf[STREAM_QUEUE_CAPACITY];
-};
-
 // queue to acquire available fd
 Queue *available_fd;
 // queue to acquire available share_unit
 Queue *available_share_unit;
+// save information of self-management socket
+mysocket socket_arr[1024];
 
 // for debug
 void my_print_hex(char *m, int length){
@@ -161,18 +147,42 @@ __attribute__((constructor)) void init(){
     // initialize random seed
     srand(time(NULL));
 
-    // initialize share memory
+    // initialize communication share memory
     shm_fd = shm_open("message_sm", O_CREAT | O_RDWR, 0666);
     if (shm_fd < 0){
         perror("shm_open failed");
         exit(1);
     }
-    ftruncate(shm_fd, 0x400000);
+    ftruncate(shm_fd, COMMUNICATE_SHM_SIZE);
 
-    shm_ptr = mmap(NULL, 0x400000, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    shm_ptr = mmap(NULL, COMMUNICATE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if(shm_ptr == (void *)-1){
         perror("mmap failed");
     }
+
+    // initialize connect share memory
+    connect_shm_fd = shm_open("connect_sm", O_CREAT | O_RDWR, 0666);
+    if (connect_shm_fd < 0){
+        perror("shm_open failed");
+        exit(1);
+    }
+    ftruncate(connect_shm_fd, CONNECT_SHM_SIZE);
+
+    connect_shm_ptr = mmap(NULL, CONNECT_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, connect_shm_fd, 0);
+    if(connect_shm_ptr == (void *)-1){
+        perror("mmap failed");
+    }
+
+    // initialize mutex lock for connect share memory
+    //initialize mutex attr
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    //lock owner dies without unlocking it, any future attempts to acquire lock on this mutex will succeed
+    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    connect_lock = (pthread_mutex_t *)(connect_shm_ptr);
+    if(pthread_mutex_init(connect_lock, &attr) != 0) perror("pthread_mutex_init");
+    connect_sa_ptr = (struct sockaddr *)(connect_shm_ptr+sizeof(pthread_mutex_t));
 
     // initialize request/response queue
     for(int i = 0; i < SOCKET_NUM; i++){
@@ -242,6 +252,16 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
         if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
             return -1;
 
+        // save bind address to connect share memory
+        if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
+            if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
+            memcpy(&connect_sa_ptr[socket_arr[fd].share_unit_index], &socket_arr[sockfd].addr, sizeof(struct sockaddr));
+            if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
+        }
+        else{
+            printf("not bind or share unit index out of bound!\n");
+        }
+
         struct sockaddr_in *fake_addr = (struct sockaddr_in *) addr;
         struct in_addr net_addr;
         // suppose client use localhost to connect
@@ -278,8 +298,12 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
 int close(int fd){
     printf("hook close()!\n");
     if(is_valid_fd(fd)){
-        initialize_share_queue(socket_arr[fd].share_unit_index);
+        init_share_queue(socket_arr[fd].share_unit_index);
         enqueue(available_share_unit, socket_arr[fd].share_unit_index);
+        // clear address in connect sockaddr array
+        if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
+        memset(&connect_sa_ptr[socket_arr[fd].share_unit_index], 0, sizeof(struct sockaddr));
+        if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
         memset(&socket_arr[fd], 0, sizeof(mysocket));
         enqueue(available_fd, fd);
     }
