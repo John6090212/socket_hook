@@ -23,10 +23,21 @@
 #include <time.h>
 // ceil
 #include <math.h>
+// hook function with variable-length argument
+#include <stdarg.h>
+// ioctl
+#include <linux/sockios.h>
+// struct ifreq
+#include <net/if.h>
+// struct arpreq
+#include <net/if_arp.h>
+// SIGPIPE
+#include <signal.h>
 #include "share_queue.h"
 #include "queue.h"
 #include "socket.h"
 #include "share.h"
+#include "stack.h"
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -41,9 +52,19 @@ ssize_t (*original_recv)(int, void *, size_t, int);
 ssize_t (*original_send)(int, const void *, size_t, int);
 int (*original_socketpair)(int, int, int, int [2]);
 int (*original_getpeername)(int, struct sockaddr *, socklen_t *);
+ssize_t (*original_read)(int fd, void *buf, size_t count);
+ssize_t (*original_write)(int fd, const void *buf, size_t count);
+int (*original_setsockopt)(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
+int (*original_getsockopt)(int sockfd, int level, int optname, void *restrict optval, socklen_t *restrict optlen);
+int (*original_fcntl)(int fd, int cmd, ...);
+int (*original_ioctl)(int fd, unsigned long request, ...);
+ssize_t (*original_recvfrom)(int socket, void *restrict buffer, size_t length, int flags, struct sockaddr *restrict address, socklen_t *restrict address_len);
+ssize_t (*original_sendto)(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len);
+ssize_t (*original_recvmsg)(int socket, struct msghdr *message, int flags);
+ssize_t (*original_sendmsg)(int socket, const struct msghdr *message, int flags);
 
 // queue to acquire available fd
-Queue *available_fd;
+Stack *available_fd;
 // queue to acquire available share_unit
 Queue *available_share_unit;
 // save information of self-management socket
@@ -97,16 +118,19 @@ int init_socket(int fd, int domain, int type, int protocol){
         .protocol = protocol,
         .has_bind = 0,
         .in_use = 1,
-        .is_shutdown = 0,
+        .shutdown_read = 0,
+        .shutdown_write = 0,
         .msg_more_buf = NULL,
         .msg_more_size = 0,
-        .share_unit_index = -1
+        .share_unit_index = -1,
+        .file_status_flags = 0
     };
     socket_arr[fd].share_unit_index = dequeue(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
         printf("need to increase SOCK_NUM\n");
         return -1;
     }
+    init_share_queue(socket_arr[fd].share_unit_index);
     socket_arr[fd].request_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_queue);
     socket_arr[fd].response_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_queue);
     socket_arr[fd].request_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_lock);
@@ -128,11 +152,21 @@ __attribute__((constructor)) void init(){
     original_send = dlsym(RTLD_NEXT, "send");
     original_socketpair = dlsym(RTLD_NEXT, "socketpair");
     original_getpeername = dlsym(RTLD_NEXT, "getpeername");
+    original_read = dlsym(RTLD_NEXT, "read");
+    original_write = dlsym(RTLD_NEXT, "write");
+    original_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+    original_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
+    original_fcntl = dlsym(RTLD_NEXT, "fcntl");
+    original_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    original_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
+    original_sendto = dlsym(RTLD_NEXT, "sendto");
+    original_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
+    original_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
 
     // initialize available fd queue
-    available_fd = createQueue(1024);
+    available_fd = createStack(1024);
     for(int i = 0; i <=1023; i++){
-        enqueue(available_fd, i);
+        push(available_fd, i);
     }
 
     // initialize available share unit queue
@@ -151,7 +185,7 @@ __attribute__((constructor)) void init(){
     shm_fd = shm_open("message_sm", O_CREAT | O_RDWR, 0666);
     if (shm_fd < 0){
         perror("shm_open failed");
-        exit(1);
+        exit(999);
     }
     ftruncate(shm_fd, COMMUNICATE_SHM_SIZE);
 
@@ -164,7 +198,7 @@ __attribute__((constructor)) void init(){
     connect_shm_fd = shm_open("connect_sm", O_CREAT | O_RDWR, 0666);
     if (connect_shm_fd < 0){
         perror("shm_open failed");
-        exit(1);
+        exit(999);
     }
     ftruncate(connect_shm_fd, CONNECT_SHM_SIZE);
 
@@ -198,8 +232,12 @@ int is_valid_fd(int sockfd){
 }
 
 int socket(int domain, int type, int protocol){
-    printf("hook socket()!\n");
-    int fd = dequeue(available_fd);
+    // printf("hook socket()!\n");
+    // filter out non-tcp and unix socket for dnsmasq
+    if(domain == AF_UNIX || type != SOCK_STREAM)
+        return original_socket(domain, type, protocol);
+
+    int fd = pop(available_fd);
     if(fd == INT_MIN){
         errno = EMFILE;
         return -1;
@@ -207,12 +245,11 @@ int socket(int domain, int type, int protocol){
     if (init_socket(fd, domain, type, protocol) == -1)
         return -1;
 
-    // return original_socket(domain, type, protocol);
     return fd;
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    printf("hook bind()!\n");
+    // printf("hook bind()!\n");
     if(is_valid_fd(sockfd)){  
         // check addrlen is valid      
         if(addrlen > sizeof(struct sockaddr)){
@@ -222,21 +259,18 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         socket_arr[sockfd].has_bind = 1;
         memcpy(&socket_arr[sockfd].addr, addr, addrlen);
     }
-    else{
-        errno = EBADF;
-        return -1;
-    }
-    // return original_bind(sockfd, addr, addrlen);
+    else
+        return original_bind(sockfd, addr, addrlen);
+
     return 0;
 }
 
 int listen(int sockfd, int backlog){
-    printf("hook listen()!\n");
+    // printf("hook listen()!\n");
     if(!is_valid_fd(sockfd)){
-        errno = EBADF;
-        return -1;
+        return original_listen(sockfd, backlog);
     }
-    // return original_listen(sockfd, backlog);
+
     return 0;
 }
 
@@ -244,7 +278,7 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     printf("hook accept()!\n");
     int fd = 0;
     if(is_valid_fd(sockfd)){
-        fd = dequeue(available_fd);
+        fd = pop(available_fd);
         if(fd == INT_MIN){
             errno = EMFILE;
             return -1;
@@ -274,81 +308,79 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
         // save peer_addr
         memcpy(&socket_arr[fd].peer_addr, fake_addr, sizeof(struct sockaddr));
     }
-    else{
-        errno = EBADF;
-        return -1;
-    }
-    // return original_accept(sockfd, addr, addrlen);
+    else
+        return original_accept(sockfd, addr, addrlen);
+
     return fd;
 }
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    printf("hook connect()!\n");
+    // printf("hook connect()!\n");
     if(is_valid_fd(sockfd)){
         memcpy(&socket_arr[sockfd].peer_addr, addr, sizeof(struct sockaddr));
     }
-    else{
-        errno = EBADF;
-        return -1;        
-    }
-    // return original_connect(sockfd, addr, addrlen);
+    else
+        return original_connect(sockfd, addr, addrlen);
+
     return 0;
 }
 
 int close(int fd){
-    printf("hook close()!\n");
+    // printf("hook close()!\n");
     if(is_valid_fd(fd)){
-        init_share_queue(socket_arr[fd].share_unit_index);
         enqueue(available_share_unit, socket_arr[fd].share_unit_index);
         // clear address in connect sockaddr array
         if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
         memset(&connect_sa_ptr[socket_arr[fd].share_unit_index], 0, sizeof(struct sockaddr));
         if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
         memset(&socket_arr[fd], 0, sizeof(mysocket));
-        enqueue(available_fd, fd);
+        push(available_fd, fd);
     }
-    else{
-        errno = EBADF;
-        return -1;        
-    }
-    // return original_close(fd);
+    else
+        return original_close(fd);
+
     return 0;
 }
 
 int shutdown(int sockfd, int how){
-    printf("hook shutdown()!\n");
+    // printf("hook shutdown()!\n");
     if(is_valid_fd(sockfd)){
-        socket_arr[sockfd].is_shutdown = 1;
-        socket_arr[sockfd].how_shutdown = how;
+        if(how == SHUT_RD)
+            socket_arr[sockfd].shutdown_read = 1;
+        else if(how == SHUT_WR)
+            socket_arr[sockfd].shutdown_write = 1;
+        else if(how == SHUT_RDWR){
+            socket_arr[sockfd].shutdown_read = 1;
+            socket_arr[sockfd].shutdown_write = 1;
+        }
     }
-    else{
-        errno = EBADF;
-        return -1;        
-    }
-    // return original_shutdown(sockfd, how);
+    else
+        return original_shutdown(sockfd, how);
+
     return 0;
 }
 
 int getsockname(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    printf("hook getsockname()!\n");
+    // printf("hook getsockname()!\n");
     if(is_valid_fd(sockfd)){
         memcpy(addr, &socket_arr[sockfd].addr, sizeof(struct sockaddr));
     }
-    else{
-        errno = EBADF;
-        return -1;
-    }
-    // return original_getsockname(sockfd, addr, addrlen);
+    else
+        return original_getsockname(sockfd, addr, addrlen);
+
     return 0;
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags){
-    if(!is_valid_fd(sockfd)){
-        errno = EBADF;
-        return -1;
-    }
+    if(!is_valid_fd(sockfd))
+        return original_recv(sockfd, buf, len, flags);
+
+    // deal with shutdown
+    if(socket_arr[sockfd].shutdown_read)
+        return 0;
+
     // handle nonblocking flag
-    if(flags & MSG_DONTWAIT){
+    if(flags & MSG_DONTWAIT || socket_arr[sockfd].file_status_flags & O_NONBLOCK){
         if(socket_arr[sockfd].request_queue->current_size == 0){
             errno = EWOULDBLOCK;
             return -1;
@@ -391,7 +423,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
         }
         else{
             printf("not implement socket type in recv!");
-            exit(777);
+            exit(999);
         }
         if(pthread_mutex_unlock(socket_arr[sockfd].request_lock) != 0) perror("pthread_mutex_unlock failed");
         // skip if no MSG_WAITALL or socket type is datagram (MSG_WAITALL has no effect)
@@ -402,12 +434,15 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags){
-    if(!is_valid_fd(sockfd)){
-        errno = EBADF;
-        return -1;
-    }
+    if(!is_valid_fd(sockfd))
+        return original_send(sockfd, buf, len, flags);
+
+    // deal with shutdown
+    if(socket_arr[sockfd].shutdown_write)
+        raise(SIGPIPE);
+
     // handle nonblocking flag
-    if(flags & MSG_DONTWAIT){
+    if(flags & MSG_DONTWAIT || socket_arr[sockfd].file_status_flags & O_NONBLOCK){
         if(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity){
             errno = EWOULDBLOCK;
             return -1;
@@ -521,7 +556,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
     }
     else{
         printf("not implement socket type in send!");
-        exit(777);
+        exit(999);
     }
     if(pthread_mutex_unlock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_unlock failed");
     
@@ -529,8 +564,12 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
 }
 
 int socketpair(int domain, int type, int protocol, int sv[2]){
-    printf("hook socketpair()!\n");
-    int fd1 = dequeue(available_fd);
+    // printf("hook socketpair()!\n");
+    // filter out non-tcp and unix socket (dnsmasq not use this function)
+    if(domain == AF_UNIX || type != SOCK_STREAM)
+        return original_socketpair(domain, type, protocol, sv);
+
+    int fd1 = pop(available_fd);
     if(fd1 == INT_MIN){
         errno = EMFILE;
         return -1;
@@ -538,10 +577,10 @@ int socketpair(int domain, int type, int protocol, int sv[2]){
     if (init_socket(fd1, domain, type, protocol) == -1)
         return -1;
 
-    int fd2 = dequeue(available_fd);
+    int fd2 = pop(available_fd);
     if(fd2 == INT_MIN){
         memset(&socket_arr[fd1], 0, sizeof(mysocket));
-        enqueue(available_fd, fd1);
+        push(available_fd, fd1);
         errno = EMFILE;
         return -1;
     }
@@ -550,19 +589,200 @@ int socketpair(int domain, int type, int protocol, int sv[2]){
 
     sv[0] = fd1;
     sv[1] = fd2; 
-    // return original_socketpair(domain, type, protocol, sv);
+
     return 0;
 }
 
 int getpeername(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    printf("hook getpeername()!\n");
+    // printf("hook getpeername()!\n");
     if(is_valid_fd(sockfd)){
         memcpy(addr, &socket_arr[sockfd].peer_addr, sizeof(struct sockaddr));
     }
-    else{
-        errno = EBADF;
-        return -1;
-    }
-    // return original_getpeername(sockfd, addr, addrlen);
+    else
+        return original_getpeername(sockfd, addr, addrlen);
+
     return 0;
+}
+
+ssize_t read(int fd, void *buf, size_t count){
+    if(!is_valid_fd(fd))
+        return original_read(fd, buf, count);
+
+    // deal with shutdown
+    if(socket_arr[fd].shutdown_read)
+        return 0;
+
+    // handle nonblocking flag
+    if(socket_arr[fd].file_status_flags & O_NONBLOCK){
+        if(socket_arr[fd].request_queue->current_size == 0){
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+    }
+    while(socket_arr[fd].request_queue->current_size == 0);
+
+    if(pthread_mutex_lock(socket_arr[fd].request_lock) != 0) perror("pthread_mutex_lock failed");
+    ssize_t my_count = 0;
+    buffer *b = stream_dequeue(shm_ptr, socket_arr[fd].request_queue, count);
+    if(b->buf != NULL){
+        memcpy(buf, b->buf, b->length *sizeof(char));
+        my_count = b->length;
+        free(b->buf);
+    }
+    free(b);
+    if(pthread_mutex_unlock(socket_arr[fd].request_lock) != 0) perror("pthread_mutex_unlock failed");
+
+    return my_count;
+}
+
+ssize_t write(int fd, const void *buf, size_t count){
+    if(!is_valid_fd(fd))
+        return original_write(fd, buf, count);
+
+    // deal with shutdown
+    if(socket_arr[fd].shutdown_write)
+        raise(SIGPIPE);
+
+    // handle nonblocking flag
+    if(socket_arr[fd].file_status_flags & O_NONBLOCK){
+        if(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity){
+            errno = EWOULDBLOCK;
+            return -1;
+        }
+    }
+    while(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity);
+
+    if(pthread_mutex_lock(socket_arr[fd].response_lock) != 0) perror("pthread_mutex_lock failed");
+    ssize_t my_count = 0;
+    my_count = stream_enqueue(shm_ptr, socket_arr[fd].response_queue, (char *)buf, count);
+    if(pthread_mutex_unlock(socket_arr[fd].response_lock) != 0) perror("pthread_mutex_unlock failed");
+
+    return my_count;
+}
+
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen){
+    if(!is_valid_fd(sockfd))
+        return original_setsockopt(sockfd, level, optname, optval, optlen);
+
+    return 0;
+}
+
+int getsockopt(int sockfd, int level, int optname, void *restrict optval, socklen_t *restrict optlen){
+    if(!is_valid_fd(sockfd))
+        return original_getsockopt(sockfd, level, optname, optval, optlen);
+
+    return 0;
+}
+
+int fcntl(int fd, int cmd, ...){
+    va_list ap;
+    va_start(ap, cmd);
+    int flags;
+    if(!is_valid_fd(fd)){
+        switch(cmd){
+            case F_GETFD:
+                va_end(ap);
+                return original_fcntl(fd, cmd);
+            case F_SETFD:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                return original_fcntl(fd, cmd, flags);
+            case F_GETFL:
+                va_end(ap);
+                return original_fcntl(fd, cmd);
+            case F_SETFL:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                return original_fcntl(fd, cmd, flags);
+            default:
+                va_end(ap);
+                printf("fcntl cmd not implement yet\n");
+                exit(999);
+        }
+    }
+    else{
+        switch(cmd){
+            case F_GETFL:
+                va_end(ap);
+                return socket_arr[fd].file_status_flags;
+            case F_SETFL:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                socket_arr[fd].file_status_flags = flags;
+                return 0;
+            default:
+                va_end(ap);
+                printf("fcntl cmd not implement yet\n");
+                exit(999);
+        }
+    }
+}
+
+int ioctl(int fd, unsigned long request, ...){
+    va_list ap;
+    va_start(ap, request);
+    int flags;
+    if(!is_valid_fd(fd)){
+        struct ifreq *ifr;
+        struct timeval *tv;
+        struct arpreq *arp;
+        switch(request){
+            case SIOCGIFNAME:
+            case SIOCGIFFLAGS:
+            case SIOCGIFADDR:
+            case SIOCGIFMTU:
+            case SIOCGIFINDEX:
+                ifr = va_arg(ap, struct ifreq*);
+                va_end(ap);
+                return original_ioctl(fd, request, ifr);
+            case SIOCGSTAMP:
+                tv = va_arg(ap, struct timeval*);
+                va_end(ap);
+                return original_ioctl(fd, request, tv);
+            case SIOCSARP:
+                arp = va_arg(ap, struct arpreq*);
+                va_end(ap);
+                return original_ioctl(fd, request, arp);
+        }
+    }
+    else{
+        va_end(ap);
+        return 0;
+    }
+}
+
+ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, struct sockaddr *restrict address, socklen_t *restrict address_len){
+    if(!is_valid_fd(socket))
+        return original_recvfrom(socket, buffer, length, flags, address, address_len);
+    else{
+        printf("recvfrom not implement this part\n");
+        exit(999);
+    }
+}
+
+ssize_t sendto(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len){
+    if(!is_valid_fd(socket))
+        return original_sendto(socket, message, length, flags, dest_addr, dest_len);
+    else{
+        printf("sendto not implement this part\n");
+        exit(999);
+    }
+}
+
+ssize_t recvmsg(int socket, struct msghdr *message, int flags){
+    if(!is_valid_fd(socket))
+        return original_recvmsg(socket, message, flags);
+    else{
+        printf("recvmsg not implement this part\n");
+        exit(999);
+    }
+}
+
+ssize_t sendmsg(int socket, const struct msghdr *message, int flags){
+    if(!is_valid_fd(socket))
+        return original_sendmsg(socket, message, flags);
+    else{
+        printf("sendmsg not implement this part\n");
+        exit(999);
+    }
 }

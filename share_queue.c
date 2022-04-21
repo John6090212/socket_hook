@@ -47,7 +47,7 @@ buffer *stream_dequeue(void *shm, share_queue *q, int len){
     char *m = (char *)malloc(sub_len*sizeof(char));
     buffer *b = (buffer *)malloc(sizeof(buffer));
     if(q->front == -1){
-        printf("Queue is empty!\n");
+        // printf("Queue is empty!\n");
         free(m);
         m = NULL;
         b->buf = m;

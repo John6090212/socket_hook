@@ -21,13 +21,13 @@ struct Queue* createQueue(unsigned capacity)
  
 // Queue is full when size becomes
 // equal to the capacity
-int isFull(struct Queue* queue)
+int isFullQueue(struct Queue* queue)
 {
     return (queue->size == queue->capacity);
 }
  
 // Queue is empty when size is 0
-int isEmpty(struct Queue* queue)
+int isEmptyQueue(struct Queue* queue)
 {
     return (queue->size == 0);
 }
@@ -36,7 +36,7 @@ int isEmpty(struct Queue* queue)
 // It changes rear and size
 int enqueue(struct Queue* queue, int item)
 {
-    if (isFull(queue))
+    if (isFullQueue(queue))
         return -1;
     queue->rear = (queue->rear + 1)
                   % queue->capacity;
@@ -49,11 +49,19 @@ int enqueue(struct Queue* queue, int item)
 // It changes front and size
 int dequeue(struct Queue* queue)
 {
-    if (isEmpty(queue))
+    if (isEmptyQueue(queue))
         return INT_MIN;
     int item = queue->array[queue->front];
     queue->front = (queue->front + 1)
                    % queue->capacity;
     queue->size = queue->size - 1;
     return item;
+}
+
+void destroyQueue(struct Queue* queue){
+    if(queue != NULL){
+        if(queue->array != NULL)
+            free(queue->array);
+        free(queue);
+    }
 }

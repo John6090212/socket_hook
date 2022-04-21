@@ -18,8 +18,8 @@ struct mysocket {
     // for getpeername
     struct sockaddr peer_addr;
     // for shutdown
-    int is_shutdown;
-    int how_shutdown;
+    int shutdown_read;
+    int shutdown_write;
     // for MSG_MORE
     // tcp
     char *msg_more_buf;
@@ -30,6 +30,8 @@ struct mysocket {
     share_queue *response_queue;
     pthread_mutex_t *request_lock;
     pthread_mutex_t *response_lock;
+    // GETFL and SETFL flags
+    int file_status_flags;
 };
 
 #endif

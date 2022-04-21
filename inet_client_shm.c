@@ -16,7 +16,7 @@
 #include "share.h"
   
 #define BUF_SIZE 100
-#define ROUND_TIME 10000000
+#define ROUND_TIME 2
 
 // print char array in hex
 void my_print_hex(char *m, int length){
@@ -104,14 +104,28 @@ int my_socket(int domain, int type, int protocol){
         .protocol = protocol,
         .has_bind = 0,
         .in_use = 1,
-        .is_shutdown = 0,
+        .shutdown_read = 0,
+        .shutdown_write = 0,
         .msg_more_buf = NULL,
         .msg_more_size = 0,
-        .share_unit_index = -1
+        .share_unit_index = -1,
+        .file_status_flags = 0
     };
 
     // return original_socket(domain, type, protocol);
     return 999;
+}
+
+int my_close(int fd){
+    if(socket_cli.in_use != 1){
+        printf("socket not in use\n");
+        return -1;
+    }
+
+    // clear socket_cli
+    memset(&socket_cli, 0, sizeof(mysocket));
+
+    return 0;
 }
 
 __attribute__((constructor)) void init(){
@@ -167,24 +181,26 @@ int main()
 
     for(int i = 0; i < ROUND_TIME; i++){
         memset(buf, (i+1)%100, BUF_SIZE);
-        if((n = my_send(sock, buf, BUF_SIZE, 0)) <= 0){
+        if((n = my_send(sock, buf, BUF_SIZE, 0)) < 0){
             printf("send failed\n");
         } 
-        // printf("[Info] Send %d bytes\n", n);  
+        printf("[Info] Send %d bytes\n", n);
 
         int recv_count = 0;
-        while(recv_count < BUF_SIZE){
-            if((n = my_recv(sock, buf+recv_count, BUF_SIZE-recv_count, 0)) <= 0){
+        // while(recv_count < BUF_SIZE){
+            if((n = my_recv(sock, buf+recv_count, BUF_SIZE-recv_count, 0)) < 0){
                 printf("recv failed\n");
             }
-            recv_count += n;
-        }            
-        // printf("[Info] Receive %d bytes\n", n);  
-        // my_print_hex(buf, n);
+            // recv_count += n;
+        // }
+        printf("[Info] Receive %d bytes\n", n);
+        my_print_hex(buf, n);
 
         // sleep(0.01);
     }
 
-    close(sock);  
+    if(my_close(sock) == -1)
+        printf("close failed\n");
+
     return 0;  
 }  

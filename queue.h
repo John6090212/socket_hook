@@ -15,9 +15,10 @@ struct Queue {
 };
 
 struct Queue* createQueue(unsigned capacity);
-int isFull(struct Queue* queue);
-int isEmpty(struct Queue* queue);
+int isFullQueue(struct Queue* queue);
+int isEmptyQueue(struct Queue* queue);
 int enqueue(struct Queue* queue, int item);
 int dequeue(struct Queue* queue);
+void destroyQueue(struct Queue* queue);
 
 #endif
