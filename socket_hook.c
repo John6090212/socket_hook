@@ -33,11 +33,16 @@
 #include <net/if_arp.h>
 // SIGPIPE
 #include <signal.h>
+// poll
+#include <poll.h>
 #include "share_queue.h"
 #include "queue.h"
 #include "socket.h"
 #include "share.h"
 #include "stack.h"
+#include "list.h"
+
+#define USE_DNSMASQ_POLL 1
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -62,6 +67,7 @@ ssize_t (*original_recvfrom)(int socket, void *restrict buffer, size_t length, i
 ssize_t (*original_sendto)(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len);
 ssize_t (*original_recvmsg)(int socket, struct msghdr *message, int flags);
 ssize_t (*original_sendmsg)(int socket, const struct msghdr *message, int flags);
+int (*original_poll)(struct pollfd *fds, nfds_t nfds, int timeout);
 
 // queue to acquire available fd
 Stack *available_fd;
@@ -69,6 +75,26 @@ Stack *available_fd;
 Queue *available_share_unit;
 // save information of self-management socket
 mysocket socket_arr[1024];
+// list for hook fd
+// struct node *hook_fd_list;
+
+// struct for pthread_create argument
+typedef struct args args;
+struct args {
+    struct pollfd *fds;
+    nfds_t nfds;
+    int timeout;
+    int rv;
+};
+
+typedef struct hook_args hook_args;
+struct hook_args {
+    struct pollfd *fds;
+    nfds_t nfds;
+    int rv;
+    pthread_mutex_t *mutex;
+    pthread_cond_t *cond;
+};
 
 // for debug
 void my_print_hex(char *m, int length){
@@ -76,6 +102,19 @@ void my_print_hex(char *m, int length){
         printf("%02x", m[i]);
     }
     printf("\n");
+}
+
+// just compare family and port
+int cmp_addr(const struct sockaddr *a, const struct sockaddr *b){
+    struct sockaddr_in *ai = (struct sockaddr_in *)a;
+    struct sockaddr_in *bi = (struct sockaddr_in *)b;
+
+    if(ai->sin_family != bi->sin_family)
+        return 0;
+    else if(ai->sin_port != bi->sin_port)
+        return 0;
+    else
+        return 1;
 }
 
 void init_share_queue(int i){
@@ -111,6 +150,42 @@ void init_share_queue(int i){
     if(pthread_mutex_init(response_lock, &attr) != 0) perror("pthread_mutex_init");
 }
 
+void init_connect_accept_queue(void){
+    connect_queue con_queue = (connect_queue){
+        .front = 0,
+        .rear = CONNECT_QUEUE_CAPACITY - 1,
+        .size = 0,
+        .capacity = CONNECT_QUEUE_CAPACITY,
+        .queue_start_offset = sizeof(connect_queue)+sizeof(accept_queue)+2*sizeof(pthread_mutex_t)
+    };
+    connect_queue_ptr = (connect_queue *)connect_shm_ptr;
+    memcpy(connect_queue_ptr, &con_queue, sizeof(connect_queue));
+
+    accept_queue acc_queue = (accept_queue){
+        .front = 0,
+        .rear = ACCEPT_QUEUE_CAPACITY - 1,
+        .size = 0,
+        .capacity = ACCEPT_QUEUE_CAPACITY,
+        .queue_start_offset = sizeof(connect_queue)+sizeof(accept_queue)+2*sizeof(pthread_mutex_t)+CONNECT_QUEUE_CAPACITY*sizeof(connection)
+    };
+    accept_queue_ptr = (accept_queue *)(connect_shm_ptr+sizeof(connect_queue));
+    memcpy(accept_queue_ptr, &acc_queue, sizeof(accept_queue));
+
+    // initialize mutex lock for connect queue and accept queue
+    //initialize mutex attr
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    //lock owner dies without unlocking it, any future attempts to acquire lock on this mutex will succeed
+    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    
+    connect_lock = (pthread_mutex_t *)(connect_shm_ptr+sizeof(connect_queue)+sizeof(accept_queue));
+    if(pthread_mutex_init(connect_lock, &attr) != 0) perror("pthread_mutex_init");
+    
+    accept_lock = (pthread_mutex_t *)(connect_shm_ptr+sizeof(connect_queue)+sizeof(accept_queue)+sizeof(pthread_mutex_t));
+    if(pthread_mutex_init(accept_lock, &attr) != 0) perror("pthread_mutex_init");
+}
+
 int init_socket(int fd, int domain, int type, int protocol){
     socket_arr[fd] = (mysocket){
         .domain = domain,
@@ -123,7 +198,10 @@ int init_socket(int fd, int domain, int type, int protocol){
         .msg_more_buf = NULL,
         .msg_more_size = 0,
         .share_unit_index = -1,
-        .file_status_flags = 0
+        .file_status_flags = 0,
+        .pollfds_index = -1,
+        .is_accept_fd = 0,
+        .is_server = 0
     };
     socket_arr[fd].share_unit_index = dequeue(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
@@ -162,8 +240,9 @@ __attribute__((constructor)) void init(){
     original_sendto = dlsym(RTLD_NEXT, "sendto");
     original_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
     original_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
+    original_poll = dlsym(RTLD_NEXT, "poll");
 
-    // initialize available fd queue
+    // initialize available fd stack
     available_fd = createStack(1024);
     for(int i = 0; i <=1023; i++){
         push(available_fd, i);
@@ -174,6 +253,9 @@ __attribute__((constructor)) void init(){
     for(int i = 0; i < SOCKET_NUM; i++){
         enqueue(available_share_unit, i);
     }
+
+    // initialize hook fd list
+    // hook_fd_list = NULL;
 
     // initialize socket array
     memset(socket_arr, 0, 1024*sizeof(mysocket));
@@ -206,17 +288,7 @@ __attribute__((constructor)) void init(){
     if(connect_shm_ptr == (void *)-1){
         perror("mmap failed");
     }
-
-    // initialize mutex lock for connect share memory
-    //initialize mutex attr
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    //lock owner dies without unlocking it, any future attempts to acquire lock on this mutex will succeed
-    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    connect_lock = (pthread_mutex_t *)(connect_shm_ptr);
-    if(pthread_mutex_init(connect_lock, &attr) != 0) perror("pthread_mutex_init");
-    connect_sa_ptr = (struct sockaddr *)(connect_shm_ptr+sizeof(pthread_mutex_t));
+    init_connect_accept_queue();
 
     // initialize request/response queue
     for(int i = 0; i < SOCKET_NUM; i++){
@@ -244,6 +316,8 @@ int socket(int domain, int type, int protocol){
     }
     if (init_socket(fd, domain, type, protocol) == -1)
         return -1;
+    
+    // insertFirst(hook_fd_list, fd);
 
     return fd;
 }
@@ -270,14 +344,22 @@ int listen(int sockfd, int backlog){
     if(!is_valid_fd(sockfd)){
         return original_listen(sockfd, backlog);
     }
+    // for poll
+    socket_arr[sockfd].is_accept_fd = 1;
 
     return 0;
 }
 
 int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    printf("hook accept()!\n");
+    // printf("hook accept()!\n");
     int fd = 0;
     if(is_valid_fd(sockfd)){
+        if(socket_arr[sockfd].file_status_flags & O_NONBLOCK){
+            if(connect_queue_ptr->size == 0){
+                errno = EWOULDBLOCK;
+                return -1;
+            }
+        }
         fd = pop(available_fd);
         if(fd == INT_MIN){
             errno = EMFILE;
@@ -285,15 +367,38 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
         }
         if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
             return -1;
+        socket_arr[fd].is_server = 1;
 
-        // save bind address to connect share memory
+        // save bind address to  share memory
         if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
+            while(connect_queue_ptr->size == 0);
             if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
-            memcpy(&connect_sa_ptr[socket_arr[fd].share_unit_index], &socket_arr[sockfd].addr, sizeof(struct sockaddr));
+            connection *c = Connect_dequeue(connect_shm_ptr, connect_queue_ptr);
             if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
+            if(c != NULL){
+                // accept connection and save share unit index to accept queue
+                if(cmp_addr(&socket_arr[sockfd].addr, &(c->addr))){
+                    acception a = (acception){
+                        .client_fd = c->client_fd,
+                        .share_unit_index = socket_arr[fd].share_unit_index
+                    };
+
+                    while(accept_queue_ptr->size == accept_queue_ptr->capacity);
+                    if(pthread_mutex_lock(accept_lock) != 0) perror("pthread_mutex_lock failed");
+                    if(Accept_enqueue(connect_shm_ptr, accept_queue_ptr, a) == -1)
+                        printf("accept queue enqueue failed\n");
+                    if(pthread_mutex_unlock(accept_lock) != 0) perror("pthread_mutex_unlock failed");
+                }
+                free(c);
+            }
+            else{
+                printf("connect queue dequeue failed\n");
+                return -1;
+            }
         }
         else{
             printf("not bind or share unit index out of bound!\n");
+            return -1;
         }
 
         struct sockaddr_in *fake_addr = (struct sockaddr_in *) addr;
@@ -330,11 +435,14 @@ int close(int fd){
     if(is_valid_fd(fd)){
         enqueue(available_share_unit, socket_arr[fd].share_unit_index);
         // clear address in connect sockaddr array
-        if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
-        memset(&connect_sa_ptr[socket_arr[fd].share_unit_index], 0, sizeof(struct sockaddr));
-        if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
+        init_connect_accept_queue();
         memset(&socket_arr[fd], 0, sizeof(mysocket));
         push(available_fd, fd);
+        /*
+        struct node *n = deleteInList(hook_fd_list, fd);
+        if(n != NULL)
+            free(n);
+        */
     }
     else
         return original_close(fd);
@@ -784,5 +892,176 @@ ssize_t sendmsg(int socket, const struct msghdr *message, int flags){
     else{
         printf("sendmsg not implement this part\n");
         exit(999);
+    }
+}
+
+// poll result for hook fd
+int hook_fd_poll(struct pollfd *fds, nfds_t nfds){
+    int rv = 0;
+    int fd;
+    for(int i = 0; i < nfds; i++){
+        fd = fds[i].fd;
+        // check POLLIN meaning
+        if(socket_arr[fd].is_accept_fd){
+            if((fds[i].events & POLLIN) && connect_queue_ptr->size > 0){
+                fds[i].revents |= POLLIN;
+                rv++;
+            }
+        }
+        else{
+            if(fds[i].events & POLLIN){
+                // check connection direction
+                if((socket_arr[fd].is_server && socket_arr[fd].request_queue->current_size > 0) || (!socket_arr[fd].is_server && socket_arr[fd].response_queue->current_size > 0)){
+                    fds[i].revents |= POLLIN;
+                    rv++;
+                }
+            }
+            else if(fds[i].events & POLLOUT){
+                // check connection direction
+                if((socket_arr[fd].is_server && socket_arr[fd].response_queue->current_size < socket_arr[fd].response_queue->capacity) || (!socket_arr[fd].is_server && socket_arr[fd].request_queue->current_size < socket_arr[fd].request_queue->capacity)){
+                    fds[i].revents |= POLLOUT;
+                    rv++; 
+                }
+            }
+        }
+    }
+    return rv;
+}
+
+void *call_poll(void *argument){
+    args *poll_arg = (args *)argument;
+
+    int oldtype;
+    /* allow the thread to be killed at any time */
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
+
+    poll_arg->rv = original_poll(poll_arg->fds, poll_arg->nfds, poll_arg->timeout);
+
+    pthread_exit(NULL);
+    return NULL;
+}
+
+void *call_hook_fd_poll(void *argument){
+    hook_args *hook_poll_arg = (hook_args *)argument;
+
+    int oldtype;
+    /* allow the thread to be killed at any time */
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
+    while(hook_poll_arg->rv == 0)
+        hook_poll_arg->rv = hook_fd_poll(hook_poll_arg->fds, hook_poll_arg->nfds);
+
+    pthread_cond_signal(hook_poll_arg->cond);
+    return NULL;
+}
+
+nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
+    nfds_t hook_nfds = 0;
+    for(int i = 0; i < nfds; i++){
+        if(is_valid_fd(fds[i].fd))
+            hook_nfds++;
+    }
+    return hook_nfds;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout){
+    int rv = 0, hook_rv = 0;
+    struct timespec abs_time;
+    int err;
+    pthread_t tid;
+    // save nfds for hook fd in poll
+    nfds_t hook_nfds = get_hook_nfds(fds, nfds);
+    // printf("hook_nfds: %ld\n", hook_nfds);
+
+    if(!USE_DNSMASQ_POLL){
+        printf("not implement yet\n");
+        exit(999);
+    }
+
+    if(timeout == 0){
+        if(nfds-hook_nfds > 0)
+            rv = original_poll(fds, nfds-hook_nfds, timeout);
+        // printf("poll rv: %d\n", rv);
+        if(rv == -1)
+            return rv;
+
+        if(hook_nfds > 0)
+            hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
+        // printf("hook_rv: %d\n", hook_rv);
+        return rv+hook_rv;
+    }
+    
+    if(timeout == -1 || timeout > 0){
+        if(nfds-hook_nfds > 0){   
+            args poll_arg = (args) {
+                .fds = fds,
+                .nfds = nfds-hook_nfds,
+                .timeout = timeout,
+                .rv = 0
+            };
+            
+            pthread_create(&tid, NULL, call_poll, (void *)&poll_arg);
+            do {
+                if(hook_nfds > 0)
+                    hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
+                if(hook_rv > 0){
+                    // printf("hook_rv: %d\n", hook_rv);
+                    if(pthread_tryjoin_np(tid, NULL) != 0){
+                        // printf("normal poll blocking\n");
+                        pthread_cancel(tid);
+                        return hook_rv;
+                    }
+                        
+                    if(poll_arg.rv == -1)
+                        return -1;
+                    // printf("poll rv: %d\n", poll_arg.rv);
+                    return hook_rv+poll_arg.rv;
+                }
+            } while(pthread_tryjoin_np(tid, NULL) != 0);
+
+            if(poll_arg.rv == -1)
+                return -1;
+            // printf("hook_rv: %d\n", hook_rv);
+            // printf("poll rv: %d\n", poll_arg.rv);
+            return hook_rv+poll_arg.rv;
+        }
+        else{
+            if(timeout == -1){
+                // printf("timeout is -1\n");
+                while(!hook_rv)
+                    hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
+
+                return hook_rv;
+            }
+            // printf("timeout > 0\n");
+            // pthread call hook_fd_poll
+            pthread_mutex_t polling = PTHREAD_MUTEX_INITIALIZER;
+            pthread_cond_t done = PTHREAD_COND_INITIALIZER;
+            hook_args hook_poll_arg = (hook_args) {
+                .fds = fds,
+                .nfds = hook_nfds,
+                .rv = 0,
+                .mutex = &polling,
+                .cond = &done
+            };
+            
+            clock_gettime(CLOCK_REALTIME, &abs_time);
+            abs_time.tv_sec += (time_t)(timeout / 1000);
+            abs_time.tv_nsec += (long)(timeout % 1000) * 1000000;
+            pthread_mutex_lock(&polling);
+
+            pthread_create(&tid, NULL, call_hook_fd_poll, (void *)&hook_poll_arg);
+            err = pthread_cond_timedwait(&done, &polling, &abs_time);
+            pthread_mutex_unlock(&polling);
+            
+            if(err == ETIMEDOUT){
+                // printf("pthread timeout\n");
+                pthread_cancel(tid);
+                return 0;
+            }
+            
+            pthread_join(tid, NULL);
+            // printf("pthread normal return\n");
+            return hook_poll_arg.rv;
+        }
     }
 }

@@ -14,9 +14,10 @@
 #include "share_queue.h"
 #include "socket.h"
 #include "share.h"
+#include "queue.h"
   
 #define BUF_SIZE 100
-#define ROUND_TIME 2
+#define ROUND_TIME 5
 
 // print char array in hex
 void my_print_hex(char *m, int length){
@@ -75,26 +76,40 @@ int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         return -1;
     }
 
-    for(int i = 0; i < SOCKET_NUM; i++){
-        if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
-        if(cmp_addr(&connect_sa_ptr[i], addr) == 1){
-            socket_cli.share_unit_index = i;
-            if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
-            // get share unit
-            socket_cli.request_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_queue);
-            socket_cli.response_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_queue);
-            socket_cli.request_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_lock);
-            socket_cli.response_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_lock);
-            break;
+    connection c = (connection){
+        .client_fd = sockfd
+    };
+    memcpy(&c.addr, addr, sizeof(struct sockaddr));
+
+    while(connect_queue_ptr->size == connect_queue_ptr->capacity);
+    if(pthread_mutex_lock(connect_lock) != 0) perror("pthread_mutex_lock failed");
+    if(Connect_enqueue(connect_shm_ptr, connect_queue_ptr, c) == -1)
+        printf("connect queue enqueue failed\n");
+    if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
+    
+    while(accept_queue_ptr->size == 0);
+    if(pthread_mutex_lock(accept_lock) != 0) perror("pthread_mutex_lock failed");
+    acception *a = Accept_dequeue(connect_shm_ptr, accept_queue_ptr);
+    if(pthread_mutex_unlock(accept_lock) != 0) perror("pthread_mutex_unlock failed");
+    
+    if(a != NULL){
+        if(a->client_fd != sockfd){
+            printf("fd is different\n");
+            free(a);
+            return -1;
         }
-        if(pthread_mutex_unlock(connect_lock) != 0) perror("pthread_mutex_unlock failed");
+        socket_cli.share_unit_index = a->share_unit_index;
+        socket_cli.request_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_queue);
+        socket_cli.response_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_queue);
+        socket_cli.request_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_lock);
+        socket_cli.response_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_lock);
+        free(a);
+        return 0;
     }
-    if(socket_cli.share_unit_index == -1){
-        printf("cannot find share unit index\n");
+    else{
+        printf("accept queue dequeue failed\n");
         return -1;
     }
-
-    return 0;
 }
 
 int my_socket(int domain, int type, int protocol){
@@ -154,8 +169,10 @@ __attribute__((constructor)) void init(){
     if(connect_shm_ptr == (void *)-1){
         perror("mmap failed");
     }
-    connect_lock = (pthread_mutex_t *)(connect_shm_ptr);
-    connect_sa_ptr = (struct sockaddr *)(connect_shm_ptr+sizeof(pthread_mutex_t));
+    connect_queue_ptr = (connect_queue *)(connect_shm_ptr);
+    accept_queue_ptr = (accept_queue *)(connect_shm_ptr+sizeof(connect_queue));
+    connect_lock = (pthread_mutex_t *)(connect_shm_ptr+sizeof(connect_queue)+sizeof(accept_queue));
+    accept_lock = (pthread_mutex_t *)(connect_shm_ptr+sizeof(connect_queue)+sizeof(accept_queue)+sizeof(pthread_mutex_t));
 
     // initialize socket_cli
     memset(&socket_cli, 0, sizeof(mysocket));

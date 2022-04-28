@@ -32,6 +32,11 @@ struct mysocket {
     pthread_mutex_t *response_lock;
     // GETFL and SETFL flags
     int file_status_flags;
+    // for dnsmasq
+    int pollfds_index;
+    // for poll
+    int is_accept_fd;
+    int is_server;
 };
 
 #endif

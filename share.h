@@ -3,9 +3,12 @@
 
 #include <pthread.h>
 #include "share_queue.h"
+#include "queue.h"
 
 #define STREAM_QUEUE_CAPACITY 30080
 #define DATAGRAM_QUEUE_CAPACITY 20
+#define CONNECT_QUEUE_CAPACITY 20
+#define ACCEPT_QUEUE_CAPACITY 10
 // share memory size for share unit
 #define COMMUNICATE_SHM_SIZE 0x400000
 // share memory size for checking socket bind arress of share unit 
@@ -16,11 +19,14 @@
 // share memory for socket communication 
 int shm_fd;
 void *shm_ptr;
+
 // share memory for socket connection share memory
 int connect_shm_fd;
 void *connect_shm_ptr;
+connect_queue *connect_queue_ptr;
+accept_queue *accept_queue_ptr;
 pthread_mutex_t *connect_lock;
-struct sockaddr *connect_sa_ptr;
+pthread_mutex_t *accept_lock;
 
 typedef struct share_unit share_unit;
 struct share_unit {
