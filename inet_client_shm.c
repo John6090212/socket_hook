@@ -30,7 +30,13 @@ void my_print_hex(char *m, int length){
 mysocket socket_cli;
 
 ssize_t my_recv(int sockfd, void *buf, size_t len, int flags){
-    while(socket_cli.response_queue->current_size == 0);
+    if(close_arr[socket_cli.share_unit_index].server_write)
+        return 0;
+
+    while(socket_cli.response_queue->current_size == 0){
+        if(close_arr[socket_cli.share_unit_index].server_write)
+            return 0;    
+    }
 
     if(pthread_mutex_lock(socket_cli.response_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t count = 0;
@@ -47,7 +53,10 @@ ssize_t my_recv(int sockfd, void *buf, size_t len, int flags){
 }
 
 ssize_t my_send(int sockfd, const void *buf, size_t len, int flags){
-    while(socket_cli.request_queue->current_size == socket_cli.request_queue->capacity);
+    while(socket_cli.request_queue->current_size == socket_cli.request_queue->capacity){
+        if(close_arr[socket_cli.share_unit_index].server_read)
+            return 0;
+    }
 
     if(pthread_mutex_lock(socket_cli.request_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t count = 0;
@@ -136,7 +145,10 @@ int my_close(int fd){
         printf("socket not in use\n");
         return -1;
     }
-
+    if(socket_cli.share_unit_index >= 0){
+        close_arr[socket_cli.share_unit_index].client_read = 1;
+        close_arr[socket_cli.share_unit_index].client_write = 1;
+    }
     // clear socket_cli
     memset(&socket_cli, 0, sizeof(mysocket));
 
@@ -176,6 +188,20 @@ __attribute__((constructor)) void init(){
 
     // initialize socket_cli
     memset(&socket_cli, 0, sizeof(mysocket));
+
+    // initialize close share memory
+    close_shm_fd = shm_open("close_sm", O_CREAT | O_RDWR, 0666);
+    if (close_shm_fd < 0){
+        perror("shm_open failed");
+        exit(999);
+    }
+    ftruncate(close_shm_fd, CLOSE_SHM_SIZE);
+
+    close_shm_ptr = mmap(NULL, CLOSE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, close_shm_fd, 0);
+    if(close_shm_ptr == (void *)-1){
+        perror("mmap failed");
+    }
+    close_arr = (close_unit *)close_shm_ptr;
 }
 
 int main()  

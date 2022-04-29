@@ -216,6 +216,20 @@ int init_socket(int fd, int domain, int type, int protocol){
     return 0;
 }
 
+int init_close_unit(int share_unit_index){
+    if(share_unit_index < 0 || share_unit_index >= SOCKET_NUM){
+        printf("share unit index out of bound\n");
+        return -1;
+    }
+
+    close_arr[share_unit_index].client_read = 0;
+    close_arr[share_unit_index].client_write = 0;
+    close_arr[share_unit_index].server_read = 0;
+    close_arr[share_unit_index].server_write = 0;
+
+    return 0;
+}
+
 __attribute__((constructor)) void init(){
     // initialize function pointer before main function
     original_socket = dlsym(RTLD_NEXT, "socket");
@@ -294,6 +308,21 @@ __attribute__((constructor)) void init(){
     for(int i = 0; i < SOCKET_NUM; i++){
         init_share_queue(i);
     }
+
+    // initialize close share memory
+    close_shm_fd = shm_open("close_sm", O_CREAT | O_RDWR, 0666);
+    if (close_shm_fd < 0){
+        perror("shm_open failed");
+        exit(999);
+    }
+    ftruncate(close_shm_fd, CLOSE_SHM_SIZE);
+
+    close_shm_ptr = mmap(NULL, CLOSE_SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, close_shm_fd, 0);
+    if(close_shm_ptr == (void *)-1){
+        perror("mmap failed");
+    }
+    memset(close_shm_ptr, 0, CLOSE_SHM_SIZE);
+    close_arr = (close_unit *)close_shm_ptr;
 }
 
 int is_valid_fd(int sockfd){
@@ -382,6 +411,9 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
                         .client_fd = c->client_fd,
                         .share_unit_index = socket_arr[fd].share_unit_index
                     };
+                    
+                    // init close unit before client accept
+                    init_close_unit(socket_arr[fd].share_unit_index);
 
                     while(accept_queue_ptr->size == accept_queue_ptr->capacity);
                     if(pthread_mutex_lock(accept_lock) != 0) perror("pthread_mutex_lock failed");
@@ -436,6 +468,10 @@ int close(int fd){
         enqueue(available_share_unit, socket_arr[fd].share_unit_index);
         // clear address in connect sockaddr array
         init_connect_accept_queue();
+        if(socket_arr[fd].share_unit_index >= 0){
+            close_arr[socket_arr[fd].share_unit_index].server_read = 1;
+            close_arr[socket_arr[fd].share_unit_index].server_write = 1;
+        }
         memset(&socket_arr[fd], 0, sizeof(mysocket));
         push(available_fd, fd);
         /*
@@ -453,13 +489,23 @@ int close(int fd){
 int shutdown(int sockfd, int how){
     // printf("hook shutdown()!\n");
     if(is_valid_fd(sockfd)){
-        if(how == SHUT_RD)
+        if(how == SHUT_RD){
             socket_arr[sockfd].shutdown_read = 1;
-        else if(how == SHUT_WR)
+            if(socket_arr[sockfd].share_unit_index >= 0)
+                close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
+        }
+        else if(how == SHUT_WR){
             socket_arr[sockfd].shutdown_write = 1;
+            if(socket_arr[sockfd].share_unit_index >= 0)
+                close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
+        }
         else if(how == SHUT_RDWR){
             socket_arr[sockfd].shutdown_read = 1;
             socket_arr[sockfd].shutdown_write = 1;
+            if(socket_arr[sockfd].share_unit_index >= 0){
+                close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
+                close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
+            }
         }
     }
     else
@@ -484,7 +530,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
         return original_recv(sockfd, buf, len, flags);
 
     // deal with shutdown
-    if(socket_arr[sockfd].shutdown_read)
+    if(socket_arr[sockfd].shutdown_read || close_arr[socket_arr[sockfd].share_unit_index].client_write)
         return 0;
 
     // handle nonblocking flag
@@ -498,7 +544,10 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
     ssize_t count = 0;
     // while loop for MSG_WAITALL
     while(count != len){
-        while(socket_arr[sockfd].request_queue->current_size == 0);
+        while(socket_arr[sockfd].request_queue->current_size == 0){
+            if(close_arr[socket_arr[sockfd].share_unit_index].client_write)
+                return 0;
+        }
 
         if(pthread_mutex_lock(socket_arr[sockfd].request_lock) != 0) perror("pthread_mutex_lock failed");
         if(socket_arr[sockfd].domain == AF_INET && socket_arr[sockfd].type == SOCK_STREAM){
@@ -556,7 +605,10 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
             return -1;
         }
     }
-    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
+    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity){
+        if(close_arr[socket_arr[sockfd].share_unit_index].client_read)
+            raise(SIGPIPE);
+    }
 
     ssize_t count = 0;
     if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) perror("pthread_mutex_lock failed");
@@ -717,7 +769,7 @@ ssize_t read(int fd, void *buf, size_t count){
         return original_read(fd, buf, count);
 
     // deal with shutdown
-    if(socket_arr[fd].shutdown_read)
+    if(socket_arr[fd].shutdown_read || close_arr[socket_arr[fd].share_unit_index].client_write)
         return 0;
 
     // handle nonblocking flag
@@ -727,7 +779,10 @@ ssize_t read(int fd, void *buf, size_t count){
             return -1;
         }
     }
-    while(socket_arr[fd].request_queue->current_size == 0);
+    while(socket_arr[fd].request_queue->current_size == 0){
+        if(close_arr[socket_arr[fd].share_unit_index].client_write)
+            return 0;
+    }
 
     if(pthread_mutex_lock(socket_arr[fd].request_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t my_count = 0;
@@ -758,7 +813,10 @@ ssize_t write(int fd, const void *buf, size_t count){
             return -1;
         }
     }
-    while(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity);
+    while(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity){
+        if(close_arr[socket_arr[fd].share_unit_index].client_read)
+            raise(SIGPIPE);
+    }
 
     if(pthread_mutex_lock(socket_arr[fd].response_lock) != 0) perror("pthread_mutex_lock failed");
     ssize_t my_count = 0;
