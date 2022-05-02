@@ -2,6 +2,7 @@
 #define _SOCKET_H_
 
 #include <pthread.h>
+#include <sys/time.h>
 #include "share_queue.h"
 typedef struct mysocket mysocket;
 #define LO_MSS 65496
@@ -37,6 +38,11 @@ struct mysocket {
     // for poll
     int is_accept_fd;
     int is_server;
+    // for socket timeout
+    struct timeval send_timeout;
+    struct timeval recv_timeout;
+    int send_timer_fd;
+    int recv_timer_fd;
 };
 
 #endif
