@@ -68,6 +68,7 @@ ssize_t (*original_write)(int fd, const void *buf, size_t count);
 int (*original_setsockopt)(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
 int (*original_getsockopt)(int sockfd, int level, int optname, void *restrict optval, socklen_t *restrict optlen);
 int (*original_fcntl)(int fd, int cmd, ...);
+int (*original_fcntl64)(int fd, int cmd, ...);
 int (*original_ioctl)(int fd, unsigned long request, ...);
 ssize_t (*original_recvfrom)(int socket, void *restrict buffer, size_t length, int flags, struct sockaddr *restrict address, socklen_t *restrict address_len);
 ssize_t (*original_sendto)(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len);
@@ -78,9 +79,11 @@ int (*original_poll)(struct pollfd *fds, nfds_t nfds, int timeout);
 // queue to acquire available fd
 Stack *available_fd;
 // queue to acquire available share_unit
-Queue *available_share_unit;
+Stack *available_share_unit;
 // save information of self-management socket
 mysocket socket_arr[1024];
+// fd for logging
+int log_fd;
 // list for hook fd
 // struct node *hook_fd_list;
 
@@ -102,12 +105,30 @@ struct hook_args {
     pthread_cond_t *cond;
 };
 
-// for debug
-void my_print_hex(char *m, int length){
-    for(int i = 0; i < length; i++){
-        printf("%02x", m[i]);
+// for performance profiling
+enum { NS_PER_SECOND = 1000000000 };
+
+void sub_timespec(struct timespec t1, struct timespec t2, struct timespec *td)
+{
+    td->tv_nsec = t2.tv_nsec - t1.tv_nsec;
+    td->tv_sec  = t2.tv_sec - t1.tv_sec;
+    if (td->tv_sec > 0 && td->tv_nsec < 0)
+    {
+        td->tv_nsec += NS_PER_SECOND;
+        td->tv_sec--;
     }
-    printf("\n");
+    else if (td->tv_sec < 0 && td->tv_nsec > 0)
+    {
+        td->tv_nsec -= NS_PER_SECOND;
+        td->tv_sec++;
+    }
+}
+
+// for debug
+void my_log_hex(char *m, int length){
+    for(int i = 0; i < length; i++){
+        log_trace("%02x", m[i]);
+    }
 }
 
 // just compare family and port
@@ -209,7 +230,7 @@ int init_socket(int fd, int domain, int type, int protocol){
         .is_accept_fd = 0,
         .is_server = 0
     };
-    socket_arr[fd].share_unit_index = dequeue(available_share_unit);
+    socket_arr[fd].share_unit_index = pop(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
         log_fatal("need to increase SOCK_NUM\n");
         return -1;
@@ -255,6 +276,7 @@ __attribute__((constructor)) void init(){
     original_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
     original_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
     original_fcntl = dlsym(RTLD_NEXT, "fcntl");
+    original_fcntl64 = dlsym(RTLD_NEXT, "fcntl64");
     original_ioctl = dlsym(RTLD_NEXT, "ioctl");
     original_recvfrom = dlsym(RTLD_NEXT, "recvfrom");
     original_sendto = dlsym(RTLD_NEXT, "sendto");
@@ -264,11 +286,17 @@ __attribute__((constructor)) void init(){
 
     // initialize logging
     log_set_quiet(true);
+    
     char *log_name = getenv("socket_hook_log");
+    log_fd = -2;
     if(log_name){
         FILE *fp = fopen((const char *)log_name, "a+");
-        log_add_fp(fp, LOG_TRACE);
+        if(fp && fileno(fp) != -1){
+            log_fd = fileno(fp);
+            log_add_fp(fp, LOG_TRACE);
+        }
     }
+    log_debug("attribute init");
     // initialize available fd stack
     available_fd = createStack(1024);
     for(int i = 0; i <=1023; i++){
@@ -276,9 +304,9 @@ __attribute__((constructor)) void init(){
     }
 
     // initialize available share unit queue
-    available_share_unit = createQueue(SOCKET_NUM);
-    for(int i = 0; i < SOCKET_NUM; i++){
-        enqueue(available_share_unit, i);
+    available_share_unit = createStack(SOCKET_NUM);
+    for(int i = SOCKET_NUM - 1; i >= 0; i--){
+        push(available_share_unit, i);
     }
 
     // initialize hook fd list
@@ -346,43 +374,55 @@ int is_valid_fd(int sockfd){
 }
 
 int socket(int domain, int type, int protocol){
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook socket()!");
     // filter out non-tcp and unix socket for dnsmasq
-    if(domain == AF_UNIX || type != SOCK_STREAM)
-        return original_socket(domain, type, protocol);
-
+    if(!(domain == AF_INET && type == SOCK_STREAM)){
+        int fd = original_socket(domain, type, protocol);
+        log_trace("use origin socket fd = %d", fd);
+        return fd;
+    }
     int fd = pop(available_fd);
     if(fd == INT_MIN){
         errno = EMFILE;
+        log_error("pop fd failed");
         return -1;
     }
-    if (init_socket(fd, domain, type, protocol) == -1)
+    if (init_socket(fd, domain, type, protocol) == -1){
+        log_error("init socket failed, fd=%d", fd);
         return -1;
-    
+    }
     // insertFirst(hook_fd_list, fd);
-
+    log_trace("use self management fd: %d", fd);
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("socket time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     return fd;
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    log_trace("hook bind()!");
+    log_trace("hook bind(), fd=%d", sockfd);
     if(is_valid_fd(sockfd)){  
         // check addrlen is valid      
         if(addrlen > sizeof(struct sockaddr)){
             errno = ENAMETOOLONG;
+            log_error("bind addrlen > sizeof(sturct sockaddr)");
             return -1;
         }
         socket_arr[sockfd].has_bind = 1;
         memcpy(&socket_arr[sockfd].addr, addr, addrlen);
     }
-    else
+    else{
+        log_trace("use original bind");
         return original_bind(sockfd, addr, addrlen);
+    }
 
     return 0;
 }
 
 int listen(int sockfd, int backlog){
-    log_trace("hook listen()!");
+    log_trace("hook listen(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd)){
         return original_listen(sockfd, backlog);
     }
@@ -393,7 +433,9 @@ int listen(int sockfd, int backlog){
 }
 
 int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    log_trace("hook accept()!");
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook accept(), fd=%d", sockfd);
     int fd = 0;
     if(is_valid_fd(sockfd)){
         if(socket_arr[sockfd].file_status_flags & O_NONBLOCK){
@@ -427,7 +469,6 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
                     
                     // init close unit before client accept
                     init_close_unit(socket_arr[fd].share_unit_index);
-
                     while(accept_queue_ptr->size == accept_queue_ptr->capacity);
                     if(pthread_mutex_lock(accept_lock) != 0) log_error("pthread_mutex_lock accept_lock failed");
                     if(Accept_enqueue(connect_shm_ptr, accept_queue_ptr, a) == -1)
@@ -437,16 +478,20 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
                 free(c);
             }
             else{
-                log_error("connect queue dequeue failed\n");
+                log_error("connect queue dequeue failed");
                 return -1;
             }
         }
         else{
-            log_error("not bind or share unit index out of bound!\n");
+            log_error("not bind or share unit index out of bound!");
             return -1;
         }
 
-        struct sockaddr_in *fake_addr = (struct sockaddr_in *) addr;
+        struct sockaddr_in *fake_addr;
+        if(addr != NULL)
+            fake_addr = (struct sockaddr_in *) addr;
+        else
+            fake_addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
         struct in_addr net_addr;
         // suppose client use localhost to connect
         char fa[] = "127.0.0.1";
@@ -457,15 +502,20 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
         fake_addr->sin_family = AF_INET;
         // save peer_addr
         memcpy(&socket_arr[fd].peer_addr, fake_addr, sizeof(struct sockaddr));
+        if(addr == NULL)
+            free(fake_addr);
     }
     else
         return original_accept(sockfd, addr, addrlen);
 
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("accept time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     return fd;
 }
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    log_trace("hook connect()!");
+    log_trace("hook connect(), fd=%d", sockfd);
     if(is_valid_fd(sockfd)){
         memcpy(&socket_arr[sockfd].peer_addr, addr, sizeof(struct sockaddr));
     }
@@ -476,9 +526,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
 }
 
 int close(int fd){
-    log_trace("hook close()!");
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook close(), fd=%d",fd);
+    if(fd == log_fd){
+        return 0;
+    }
     if(is_valid_fd(fd)){
-        enqueue(available_share_unit, socket_arr[fd].share_unit_index);
+        push(available_share_unit, socket_arr[fd].share_unit_index);
         // clear address in connect sockaddr array
         init_connect_accept_queue();
         if(socket_arr[fd].share_unit_index >= 0){
@@ -492,15 +547,18 @@ int close(int fd){
         if(n != NULL)
             free(n);
         */
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("close time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+        return 0;
     }
     else
         return original_close(fd);
 
-    return 0;
 }
 
 int shutdown(int sockfd, int how){
-    log_trace("hook shutdown()!");
+    log_trace("hook shutdown(), fd=%d", sockfd);
     if(is_valid_fd(sockfd)){
         if(how == SHUT_RD){
             socket_arr[sockfd].shutdown_read = 1;
@@ -528,17 +586,18 @@ int shutdown(int sockfd, int how){
 }
 
 int getsockname(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    log_trace("hook getsockname()!");
+    log_trace("hook getsockname(), fd=%d", sockfd);
     if(is_valid_fd(sockfd)){
         memcpy(addr, &socket_arr[sockfd].addr, sizeof(struct sockaddr));
     }
     else
         return original_getsockname(sockfd, addr, addrlen);
-
+    log_trace("getsocketname return 0");
     return 0;
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags){
+    log_trace("hook recv(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_recv(sockfd, buf, len, flags);
 
@@ -604,6 +663,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags){
+    log_trace("hook send(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_send(sockfd, buf, len, flags);
 
@@ -767,17 +827,21 @@ int socketpair(int domain, int type, int protocol, int sv[2]){
 }
 
 int getpeername(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    log_trace("hook getpeername()!");
+    log_trace("hook getpeername(), fd=%d", sockfd);
     if(is_valid_fd(sockfd)){
         memcpy(addr, &socket_arr[sockfd].peer_addr, sizeof(struct sockaddr));
     }
     else
         return original_getpeername(sockfd, addr, addrlen);
 
+    log_trace("getpeername return 0");
     return 0;
 }
 
 ssize_t read(int fd, void *buf, size_t count){
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook read(), fd=%d, count=%ld", fd, count);
     if(!is_valid_fd(fd))
         return original_read(fd, buf, count);
 
@@ -787,16 +851,23 @@ ssize_t read(int fd, void *buf, size_t count){
 
     // handle nonblocking flag
     if(socket_arr[fd].file_status_flags & O_NONBLOCK){
+        log_trace("non-blocking read");
         if(socket_arr[fd].request_queue->current_size == 0){
             errno = EWOULDBLOCK;
+            log_trace("read EWOULDBLOCK");
             return -1;
         }
     }
-    while(socket_arr[fd].request_queue->current_size == 0){
-        if(close_arr[socket_arr[fd].share_unit_index].client_write)
+    log_trace("start blocking");
+    while(__sync_bool_compare_and_swap(&socket_arr[fd].request_queue->current_size, 0, 0)){
+        if(__sync_fetch_and_add(&close_arr[socket_arr[fd].share_unit_index].client_write, 0)){
+            clock_gettime(CLOCK_REALTIME, &finish);
+            sub_timespec(start, finish, &delta);
+            log_info("read (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
             return 0;
+        }
     }
-
+    log_trace("start get lock");
     if(pthread_mutex_lock(socket_arr[fd].request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
     ssize_t my_count = 0;
     buffer *b = stream_dequeue(shm_ptr, socket_arr[fd].request_queue, count);
@@ -807,14 +878,22 @@ ssize_t read(int fd, void *buf, size_t count){
     }
     free(b);
     if(pthread_mutex_unlock(socket_arr[fd].request_lock) != 0) log_error("pthread_mutex_unlock request_lock failed");
-
+    // my_log_hex(buf, my_count);
+    log_trace("read return %ld", my_count);
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("read (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     return my_count;
 }
 
 ssize_t write(int fd, const void *buf, size_t count){
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook write(), fd=%d, count=%ld", fd, count);
     if(!is_valid_fd(fd))
         return original_write(fd, buf, count);
 
+    // my_log_hex(buf, count);
     // deal with shutdown
     if(socket_arr[fd].shutdown_write)
         raise(SIGPIPE);
@@ -827,19 +906,27 @@ ssize_t write(int fd, const void *buf, size_t count){
         }
     }
     while(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity){
-        if(close_arr[socket_arr[fd].share_unit_index].client_read)
+        if(close_arr[socket_arr[fd].share_unit_index].client_read){
+            clock_gettime(CLOCK_REALTIME, &finish);
+            sub_timespec(start, finish, &delta);
+            log_info("write (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            log_trace("write raise SIGPIPE");
             raise(SIGPIPE);
+        }
     }
 
     if(pthread_mutex_lock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
     ssize_t my_count = 0;
     my_count = stream_enqueue(shm_ptr, socket_arr[fd].response_queue, (char *)buf, count);
     if(pthread_mutex_unlock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
-
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("write (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     return my_count;
 }
 
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen){
+    log_trace("hook setsockopt(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_setsockopt(sockfd, level, optname, optval, optlen);
 
@@ -847,6 +934,7 @@ int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t
 }
 
 int getsockopt(int sockfd, int level, int optname, void *restrict optval, socklen_t *restrict optlen){
+    log_trace("hook getsockopt(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_getsockopt(sockfd, level, optname, optval, optlen);
 
@@ -854,6 +942,7 @@ int getsockopt(int sockfd, int level, int optname, void *restrict optval, sockle
 }
 
 int fcntl(int fd, int cmd, ...){
+    log_trace("hook fcntl(), fd=%d", fd);
     va_list ap;
     va_start(ap, cmd);
     int flags;
@@ -883,11 +972,13 @@ int fcntl(int fd, int cmd, ...){
         switch(cmd){
             case F_GETFL:
                 va_end(ap);
+                log_trace("cmd=F_GETFL, return %d", socket_arr[fd].file_status_flags);
                 return socket_arr[fd].file_status_flags;
             case F_SETFL:
                 flags = va_arg(ap, int);
                 va_end(ap);
                 socket_arr[fd].file_status_flags = flags;
+                log_trace("cmd=F_SETFL, return %d", socket_arr[fd].file_status_flags);
                 return 0;
             default:
                 va_end(ap);
@@ -897,7 +988,55 @@ int fcntl(int fd, int cmd, ...){
     }
 }
 
+int fcntl64(int fd, int cmd, ...){
+    log_trace("hook fcntl64(), fd=%d", fd);
+    va_list ap;
+    va_start(ap, cmd);
+    int flags;
+    if(!is_valid_fd(fd)){
+        switch(cmd){
+            case F_GETFD:
+                va_end(ap);
+                return original_fcntl64(fd, cmd);
+            case F_SETFD:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                return original_fcntl64(fd, cmd, flags);
+            case F_GETFL:
+                va_end(ap);
+                return original_fcntl64(fd, cmd);
+            case F_SETFL:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                return original_fcntl64(fd, cmd, flags);
+            default:
+                va_end(ap);
+                log_fatal("fcntl64 cmd not implement yet");
+                exit(999);
+        }
+    }
+    else{
+        switch(cmd){
+            case F_GETFL:
+                va_end(ap);
+                log_trace("cmd=F_GETFL, return %d", socket_arr[fd].file_status_flags);
+                return socket_arr[fd].file_status_flags;
+            case F_SETFL:
+                flags = va_arg(ap, int);
+                va_end(ap);
+                socket_arr[fd].file_status_flags = flags;
+                log_trace("cmd=F_SETFL, return %d", socket_arr[fd].file_status_flags);
+                return 0;
+            default:
+                va_end(ap);
+                log_fatal("fcntl64 cmd not implement yet");
+                exit(999);
+        }
+    }
+}
+
 int ioctl(int fd, unsigned long request, ...){
+    log_trace("hook ioctl(), fd=%d", fd);
     va_list ap;
     va_start(ap, request);
     if(!is_valid_fd(fd)){
@@ -929,6 +1068,7 @@ int ioctl(int fd, unsigned long request, ...){
 }
 
 ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, struct sockaddr *restrict address, socklen_t *restrict address_len){
+    log_trace("hook recvfrom()!");
     if(!is_valid_fd(socket))
         return original_recvfrom(socket, buffer, length, flags, address, address_len);
     else{
@@ -938,6 +1078,7 @@ ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, st
 }
 
 ssize_t sendto(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len){
+    log_trace("hook sendto()!");
     if(!is_valid_fd(socket))
         return original_sendto(socket, message, length, flags, dest_addr, dest_len);
     else{
@@ -947,6 +1088,7 @@ ssize_t sendto(int socket, const void *message, size_t length, int flags, const 
 }
 
 ssize_t recvmsg(int socket, struct msghdr *message, int flags){
+    log_trace("hook recvmsg()!");
     if(!is_valid_fd(socket))
         return original_recvmsg(socket, message, flags);
     else{
@@ -956,6 +1098,7 @@ ssize_t recvmsg(int socket, struct msghdr *message, int flags){
 }
 
 ssize_t sendmsg(int socket, const struct msghdr *message, int flags){
+    log_trace("hook sendmsg()!");
     if(!is_valid_fd(socket))
         return original_sendmsg(socket, message, flags);
     else{
@@ -1012,6 +1155,19 @@ void *call_poll(void *argument){
     return NULL;
 }
 
+void *call_hook_fd_poll(void *argument){
+    hook_args *hook_poll_arg = (hook_args *)argument;
+
+    int oldtype;
+    /* allow the thread to be killed at any time */
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
+    while(hook_poll_arg->rv == 0)
+        hook_poll_arg->rv = hook_fd_poll(hook_poll_arg->fds, hook_poll_arg->nfds);
+
+    pthread_cond_signal(hook_poll_arg->cond);
+    return NULL;
+}
+
 nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
     nfds_t hook_nfds = 0;
     for(int i = 0; i < nfds; i++){
@@ -1021,57 +1177,10 @@ nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
     return hook_nfds;
 }
 
-int my_poll_settimer(int timeout){
-    int fd;
-    if((fd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK)) == -1){
-        log_error("my_poll timerfd_create failed");
-        return -1;
-    }    
-
-    struct timespec now;
-    if (clock_gettime(CLOCK_REALTIME, &now) == -1){
-        log_error("clock_gettime failed");
-        return -1;
-    }
-
-    struct itimerspec new_value = (struct itimerspec){
-        .it_interval = (struct timespec){
-            .tv_sec = 0,
-            .tv_nsec = 0
-        },
-        .it_value = (struct timespec){
-            .tv_sec = now.tv_sec + (time_t)(timeout / 1000),
-            .tv_nsec = now.tv_nsec + (long)(timeout % 1000) * 1000000
-        }
-    };
-    if(timerfd_settime(fd, TFD_TIMER_ABSTIME, &new_value, NULL) == -1){
-        log_error("poll settimer failed");
-        return -1;
-    }
-
-    return fd;
-}
-
-int my_poll_stoptimer(int fd){
-    struct itimerspec new_value = (struct itimerspec){
-        .it_interval = (struct timespec){
-            .tv_sec = 0,
-            .tv_nsec = 0
-        },
-        .it_value = (struct timespec){
-            .tv_sec = 0,
-            .tv_nsec = 0
-        }
-    };    
-    if(timerfd_settime(fd, TFD_TIMER_ABSTIME, &new_value, NULL) == -1){
-        log_error("stoptimer failed");
-        return -1;
-    }
-
-    return 0;
-}
-
 int poll(struct pollfd *fds, nfds_t nfds, int timeout){
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook poll()!");
     int rv = 0, hook_rv = 0;
     struct timespec abs_time;
     int err;
@@ -1116,20 +1225,37 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
                 if(pthread_tryjoin_np(tid, NULL) != 0){
                     // log_debug("normal poll blocking");
                     pthread_cancel(tid);
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("poll (hook+ n-) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
                     return hook_rv;
                 }
                     
-                if(poll_arg.rv == -1)
+                if(poll_arg.rv == -1){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
                     return -1;
+                }
                 // log_debug("poll rv: %d", poll_arg.rv);
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("poll (hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
                 return hook_rv+poll_arg.rv;
             }
         } while(pthread_tryjoin_np(tid, NULL) != 0);
 
-        if(poll_arg.rv == -1)
+        if(poll_arg.rv == -1){
+            clock_gettime(CLOCK_REALTIME, &finish);
+            sub_timespec(start, finish, &delta);
+            log_info("poll (join n-) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
             return -1;
+        }
         // log_debug("hook_rv: %d", hook_rv);
         // log_debug("poll rv: %d", poll_arg.rv);
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("poll (join hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
         return hook_rv+poll_arg.rv;
     }
 
@@ -1139,42 +1265,45 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
         while(!hook_rv)
             hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
 
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("poll (only hook fd infinite loop) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
         return hook_rv;
     }
     
     // no original poll and timeout > 0
-    int tfd;
-    if((tfd = my_poll_settimer(timeout)) == -1){
-        return -1;
+    pthread_mutex_t polling = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t done = PTHREAD_COND_INITIALIZER;
+    hook_args hook_poll_arg = (hook_args) {
+        .fds = fds,
+        .nfds = hook_nfds,
+        .rv = 0,
+        .mutex = &polling,
+        .cond = &done
+    };
+    
+    clock_gettime(CLOCK_REALTIME, &abs_time);
+    abs_time.tv_sec += (time_t)(timeout / 1000);
+    abs_time.tv_nsec += (long)(timeout % 1000) * 1000000;
+    pthread_mutex_lock(&polling);
+
+    pthread_create(&tid, NULL, call_hook_fd_poll, (void *)&hook_poll_arg);
+    err = pthread_cond_timedwait(&done, &polling, &abs_time);
+    pthread_mutex_unlock(&polling);
+    
+    if(err == ETIMEDOUT){
+        // printf("pthread timeout\n");
+        pthread_cancel(tid);
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("only hook fd poll timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+        return 0;
     }
 
-    while(1){
-        hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
-        if(hook_rv > 0){
-            if(my_poll_stoptimer(tfd) == -1){
-                close(tfd);
-                return -1;
-            }
-            close(tfd);
-            break;
-        }
-        
-        uint64_t i;
-        ssize_t n = read(tfd, &i, sizeof(uint64_t));
-        if(n == -1){
-            if(errno == EAGAIN)
-                continue;
-
-            log_error("my_poll read timerfd failed");
-            close(tfd);
-            return -1;
-        }
-
-        if(n == sizeof(uint64_t)){
-            close(tfd);
-            return 0;
-        }
-    }
-
-    return hook_rv;
+    pthread_join(tid, NULL);
+    // printf("pthread normal return\n");
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("only hook fd poll time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    return hook_poll_arg.rv;
 }
