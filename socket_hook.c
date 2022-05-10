@@ -84,8 +84,7 @@ Stack *available_share_unit;
 mysocket socket_arr[1024];
 // fd for logging
 int log_fd;
-// list for hook fd
-// struct node *hook_fd_list;
+struct timespec hook_start_time;
 
 // struct for pthread_create argument
 typedef struct args args;
@@ -258,6 +257,7 @@ int init_close_unit(int share_unit_index){
 }
 
 __attribute__((constructor)) void init(){
+    clock_gettime(CLOCK_REALTIME, &hook_start_time);
     // initialize function pointer before main function
     original_socket = dlsym(RTLD_NEXT, "socket");
     original_bind = dlsym(RTLD_NEXT, "bind");
@@ -286,17 +286,16 @@ __attribute__((constructor)) void init(){
 
     // initialize logging
     log_set_quiet(true);
-    
-    char *log_name = getenv("socket_hook_log");
     log_fd = -2;
+    char *log_name = getenv("socket_hook_log");
     if(log_name){
-        FILE *fp = fopen((const char *)log_name, "a+");
+        FILE *fp = fopen((const char *)log_name, "w+");
         if(fp && fileno(fp) != -1){
             log_fd = fileno(fp);
-            log_add_fp(fp, LOG_TRACE);
+            log_add_fp(fp, LOG_ERROR);
         }
     }
-    log_debug("attribute init");
+    //log_debug("attribute init");
     // initialize available fd stack
     available_fd = createStack(1024);
     for(int i = 0; i <=1023; i++){
@@ -308,9 +307,6 @@ __attribute__((constructor)) void init(){
     for(int i = SOCKET_NUM - 1; i >= 0; i--){
         push(available_share_unit, i);
     }
-
-    // initialize hook fd list
-    // hook_fd_list = NULL;
 
     // initialize socket array
     memset(socket_arr, 0, 1024*sizeof(mysocket));
@@ -374,15 +370,13 @@ int is_valid_fd(int sockfd){
 }
 
 int socket(int domain, int type, int protocol){
+    // filter out non-tcp and unix socket for dnsmasq
+    if(!(domain == AF_INET && type == SOCK_STREAM))
+        return original_socket(domain, type, protocol);
+
     struct timespec start, finish, delta;
     clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook socket()!");
-    // filter out non-tcp and unix socket for dnsmasq
-    if(!(domain == AF_INET && type == SOCK_STREAM)){
-        int fd = original_socket(domain, type, protocol);
-        log_trace("use origin socket fd = %d", fd);
-        return fd;
-    }
     int fd = pop(available_fd);
     if(fd == INT_MIN){
         errno = EMFILE;
@@ -393,7 +387,6 @@ int socket(int domain, int type, int protocol){
         log_error("init socket failed, fd=%d", fd);
         return -1;
     }
-    // insertFirst(hook_fd_list, fd);
     log_trace("use self management fd: %d", fd);
     clock_gettime(CLOCK_REALTIME, &finish);
     sub_timespec(start, finish, &delta);
@@ -402,21 +395,18 @@ int socket(int domain, int type, int protocol){
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    log_trace("hook bind(), fd=%d", sockfd);
-    if(is_valid_fd(sockfd)){  
-        // check addrlen is valid      
-        if(addrlen > sizeof(struct sockaddr)){
-            errno = ENAMETOOLONG;
-            log_error("bind addrlen > sizeof(sturct sockaddr)");
-            return -1;
-        }
-        socket_arr[sockfd].has_bind = 1;
-        memcpy(&socket_arr[sockfd].addr, addr, addrlen);
-    }
-    else{
-        log_trace("use original bind");
+    if(!is_valid_fd(sockfd)) 
         return original_bind(sockfd, addr, addrlen);
+
+    log_trace("hook bind(), fd=%d", sockfd);
+    // check addrlen is valid      
+    if(addrlen > sizeof(struct sockaddr)){
+        errno = ENAMETOOLONG;
+        log_error("bind addrlen > sizeof(sturct sockaddr)");
+        return -1;
     }
+    socket_arr[sockfd].has_bind = 1;
+    memcpy(&socket_arr[sockfd].addr, addr, addrlen);
 
     return 0;
 }
@@ -433,80 +423,81 @@ int listen(int sockfd, int backlog){
 }
 
 int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
+    if(!is_valid_fd(sockfd))
+        return original_accept(sockfd, addr, addrlen);
+    
     struct timespec start, finish, delta;
+    int fd = 0;    
     clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook accept(), fd=%d", sockfd);
-    int fd = 0;
-    if(is_valid_fd(sockfd)){
-        if(socket_arr[sockfd].file_status_flags & O_NONBLOCK){
-            if(connect_queue_ptr->size == 0){
-                errno = EWOULDBLOCK;
-                return -1;
-            }
-        }
-        fd = pop(available_fd);
-        if(fd == INT_MIN){
-            errno = EMFILE;
+    if(socket_arr[sockfd].file_status_flags & O_NONBLOCK){
+        if(connect_queue_ptr->size == 0){
+            errno = EWOULDBLOCK;
             return -1;
         }
-        if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
-            return -1;
-        socket_arr[fd].is_server = 1;
+    }
+    fd = pop(available_fd);
+    if(fd == INT_MIN){
+        errno = EMFILE;
+        return -1;
+    }
+    if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
+        return -1;
+    socket_arr[fd].is_server = 1;
 
-        // save bind address to  share memory
-        if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
-            while(connect_queue_ptr->size == 0);
-            if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
-            connection *c = Connect_dequeue(connect_shm_ptr, connect_queue_ptr);
-            if(pthread_mutex_unlock(connect_lock) != 0) log_error("pthread_mutex_unlock connect_lock failed");
-            if(c != NULL){
-                // accept connection and save share unit index to accept queue
-                if(cmp_addr(&socket_arr[sockfd].addr, &(c->addr))){
-                    acception a = (acception){
-                        .client_fd = c->client_fd,
-                        .share_unit_index = socket_arr[fd].share_unit_index
-                    };
-                    
-                    // init close unit before client accept
-                    init_close_unit(socket_arr[fd].share_unit_index);
-                    while(accept_queue_ptr->size == accept_queue_ptr->capacity);
-                    if(pthread_mutex_lock(accept_lock) != 0) log_error("pthread_mutex_lock accept_lock failed");
-                    if(Accept_enqueue(connect_shm_ptr, accept_queue_ptr, a) == -1)
-                        log_error("accept queue enqueue failed");
-                    if(pthread_mutex_unlock(accept_lock) != 0) log_error("pthread_mutex_unlock accept_lock failed");
-                }
-                free(c);
+    // save bind address to share memory
+    if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
+        while(connect_queue_ptr->size == 0)
+            usleep(1);
+        if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
+        connection *c = Connect_dequeue(connect_shm_ptr, connect_queue_ptr);
+        if(pthread_mutex_unlock(connect_lock) != 0) log_error("pthread_mutex_unlock connect_lock failed");
+        if(c != NULL){
+            // accept connection and save share unit index to accept queue
+            if(cmp_addr(&socket_arr[sockfd].addr, &(c->addr))){
+                acception a = (acception){
+                    .client_fd = c->client_fd,
+                    .share_unit_index = socket_arr[fd].share_unit_index
+                };
+                
+                // init close unit before client accept
+                init_close_unit(socket_arr[fd].share_unit_index);
+                while(accept_queue_ptr->size == accept_queue_ptr->capacity)
+                    usleep(1);
+                if(pthread_mutex_lock(accept_lock) != 0) log_error("pthread_mutex_lock accept_lock failed");
+                if(Accept_enqueue(connect_shm_ptr, accept_queue_ptr, a) == -1)
+                    log_error("accept queue enqueue failed");
+                if(pthread_mutex_unlock(accept_lock) != 0) log_error("pthread_mutex_unlock accept_lock failed");
             }
-            else{
-                log_error("connect queue dequeue failed");
-                return -1;
-            }
+            free(c);
         }
         else{
-            log_error("not bind or share unit index out of bound!");
+            log_error("connect queue dequeue failed");
             return -1;
         }
-
-        struct sockaddr_in *fake_addr;
-        if(addr != NULL)
-            fake_addr = (struct sockaddr_in *) addr;
-        else
-            fake_addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
-        struct in_addr net_addr;
-        // suppose client use localhost to connect
-        char fa[] = "127.0.0.1";
-        inet_aton(fa, &net_addr);
-        fake_addr->sin_addr = net_addr;
-        // get random port for peer
-        fake_addr->sin_port = rand() % 10000 + 10000;
-        fake_addr->sin_family = AF_INET;
-        // save peer_addr
-        memcpy(&socket_arr[fd].peer_addr, fake_addr, sizeof(struct sockaddr));
-        if(addr == NULL)
-            free(fake_addr);
     }
+    else{
+        log_error("not bind or share unit index out of bound!");
+        return -1;
+    }
+
+    struct sockaddr_in *fake_addr;
+    if(addr != NULL)
+        fake_addr = (struct sockaddr_in *) addr;
     else
-        return original_accept(sockfd, addr, addrlen);
+        fake_addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in));
+    struct in_addr net_addr;
+    // suppose client use localhost to connect
+    char fa[] = "127.0.0.1";
+    inet_aton(fa, &net_addr);
+    fake_addr->sin_addr = net_addr;
+    // get random port for peer
+    fake_addr->sin_port = rand() % 10000 + 10000;
+    fake_addr->sin_family = AF_INET;
+    // save peer_addr
+    memcpy(&socket_arr[fd].peer_addr, fake_addr, sizeof(struct sockaddr));
+    if(addr == NULL)
+        free(fake_addr); 
 
     clock_gettime(CLOCK_REALTIME, &finish);
     sub_timespec(start, finish, &delta);
@@ -515,92 +506,86 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
 }
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
-    log_trace("hook connect(), fd=%d", sockfd);
-    if(is_valid_fd(sockfd)){
-        memcpy(&socket_arr[sockfd].peer_addr, addr, sizeof(struct sockaddr));
-    }
-    else
+    if(!is_valid_fd(sockfd))
         return original_connect(sockfd, addr, addrlen);
+        
+    log_trace("hook connect(), fd=%d", sockfd);
+    memcpy(&socket_arr[sockfd].peer_addr, addr, sizeof(struct sockaddr));
 
     return 0;
 }
 
 int close(int fd){
-    struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
-    log_trace("hook close(), fd=%d",fd);
     if(fd == log_fd){
+        log_trace("hook close(), log_fd=%d",fd);
         return 0;
     }
-    if(is_valid_fd(fd)){
-        push(available_share_unit, socket_arr[fd].share_unit_index);
-        // clear address in connect sockaddr array
-        init_connect_accept_queue();
-        if(socket_arr[fd].share_unit_index >= 0){
-            close_arr[socket_arr[fd].share_unit_index].server_read = 1;
-            close_arr[socket_arr[fd].share_unit_index].server_write = 1;
-        }
-        memset(&socket_arr[fd], 0, sizeof(mysocket));
-        push(available_fd, fd);
-        /*
-        struct node *n = deleteInList(hook_fd_list, fd);
-        if(n != NULL)
-            free(n);
-        */
-        clock_gettime(CLOCK_REALTIME, &finish);
-        sub_timespec(start, finish, &delta);
-        log_info("close time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-        return 0;
-    }
-    else
+
+    if(!is_valid_fd(fd))
         return original_close(fd);
 
+    log_trace("hook close(), fd=%d",fd);
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+
+    push(available_share_unit, socket_arr[fd].share_unit_index);
+    // clear address in connect sockaddr array
+    init_connect_accept_queue();
+    if(socket_arr[fd].share_unit_index >= 0){
+        close_arr[socket_arr[fd].share_unit_index].server_read = 1;
+        close_arr[socket_arr[fd].share_unit_index].server_write = 1;
+    }
+    memset(&socket_arr[fd], 0, sizeof(mysocket));
+    push(available_fd, fd);
+
+    clock_gettime(CLOCK_REALTIME, &finish);
+    sub_timespec(start, finish, &delta);
+    log_info("close time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    return 0;   
 }
 
 int shutdown(int sockfd, int how){
-    log_trace("hook shutdown(), fd=%d", sockfd);
-    if(is_valid_fd(sockfd)){
-        if(how == SHUT_RD){
-            socket_arr[sockfd].shutdown_read = 1;
-            if(socket_arr[sockfd].share_unit_index >= 0)
-                close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
-        }
-        else if(how == SHUT_WR){
-            socket_arr[sockfd].shutdown_write = 1;
-            if(socket_arr[sockfd].share_unit_index >= 0)
-                close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
-        }
-        else if(how == SHUT_RDWR){
-            socket_arr[sockfd].shutdown_read = 1;
-            socket_arr[sockfd].shutdown_write = 1;
-            if(socket_arr[sockfd].share_unit_index >= 0){
-                close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
-                close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
-            }
-        }
-    }
-    else
+    if(!is_valid_fd(sockfd))
         return original_shutdown(sockfd, how);
+
+    log_trace("hook shutdown(), fd=%d", sockfd);
+    if(how == SHUT_RD){
+        socket_arr[sockfd].shutdown_read = 1;
+        if(socket_arr[sockfd].share_unit_index >= 0)
+            close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
+    }
+    else if(how == SHUT_WR){
+        socket_arr[sockfd].shutdown_write = 1;
+        if(socket_arr[sockfd].share_unit_index >= 0)
+            close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
+    }
+    else if(how == SHUT_RDWR){
+        socket_arr[sockfd].shutdown_read = 1;
+        socket_arr[sockfd].shutdown_write = 1;
+        if(socket_arr[sockfd].share_unit_index >= 0){
+            close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
+            close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
+        }
+    }   
 
     return 0;
 }
 
 int getsockname(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    log_trace("hook getsockname(), fd=%d", sockfd);
-    if(is_valid_fd(sockfd)){
-        memcpy(addr, &socket_arr[sockfd].addr, sizeof(struct sockaddr));
-    }
-    else
+    if(!is_valid_fd(sockfd))
         return original_getsockname(sockfd, addr, addrlen);
-    log_trace("getsocketname return 0");
+
+    log_trace("hook getsockname(), fd=%d", sockfd);
+    memcpy(addr, &socket_arr[sockfd].addr, sizeof(struct sockaddr));   
+
     return 0;
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags){
-    log_trace("hook recv(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_recv(sockfd, buf, len, flags);
 
+    log_trace("hook recv(), fd=%d", sockfd);
     // deal with shutdown
     if(socket_arr[sockfd].shutdown_read || close_arr[socket_arr[sockfd].share_unit_index].client_write)
         return 0;
@@ -619,6 +604,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
         while(socket_arr[sockfd].request_queue->current_size == 0){
             if(close_arr[socket_arr[sockfd].share_unit_index].client_write)
                 return 0;
+            usleep(1);
         }
 
         if(pthread_mutex_lock(socket_arr[sockfd].request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
@@ -663,10 +649,10 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags){
-    log_trace("hook send(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_send(sockfd, buf, len, flags);
 
+    log_trace("hook send(), fd=%d", sockfd);
     // deal with shutdown
     if(socket_arr[sockfd].shutdown_write)
         raise(SIGPIPE);
@@ -681,6 +667,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
     while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity){
         if(close_arr[socket_arr[sockfd].share_unit_index].client_read)
             raise(SIGPIPE);
+        usleep(1);
     }
 
     ssize_t count = 0;
@@ -723,7 +710,8 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
                     }    
                 }
                 else{
-                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
+                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity)
+                        usleep(1);
 
                     if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
                     if(i == send_times - 1) 
@@ -761,7 +749,8 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
                     }   
                 }
                 else{
-                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity);
+                    while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity)
+                        usleep(1);
 
                     if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
                     if(i == send_times - 1) 
@@ -797,11 +786,11 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
 }
 
 int socketpair(int domain, int type, int protocol, int sv[2]){
-    log_trace("hook socketpair()!");
     // filter out non-tcp and unix socket (dnsmasq not use this function)
     if(domain == AF_UNIX || type != SOCK_STREAM)
         return original_socketpair(domain, type, protocol, sv);
 
+    log_trace("hook socketpair()!");
     int fd1 = pop(available_fd);
     if(fd1 == INT_MIN){
         errno = EMFILE;
@@ -827,31 +816,31 @@ int socketpair(int domain, int type, int protocol, int sv[2]){
 }
 
 int getpeername(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen){
-    log_trace("hook getpeername(), fd=%d", sockfd);
-    if(is_valid_fd(sockfd)){
-        memcpy(addr, &socket_arr[sockfd].peer_addr, sizeof(struct sockaddr));
-    }
-    else
+    if(!is_valid_fd(sockfd))
         return original_getpeername(sockfd, addr, addrlen);
-
+        
+    log_trace("hook getpeername(), fd=%d", sockfd);
+    memcpy(addr, &socket_arr[sockfd].peer_addr, sizeof(struct sockaddr));
     log_trace("getpeername return 0");
     return 0;
 }
 
 ssize_t read(int fd, void *buf, size_t count){
-    struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
-    log_trace("hook read(), fd=%d, count=%ld", fd, count);
     if(!is_valid_fd(fd))
         return original_read(fd, buf, count);
 
+    struct timespec start, finish, delta;
+    clock_gettime(CLOCK_REALTIME, &start);
+    log_trace("hook read(), fd=%d, count=%ld", fd, count);
     // deal with shutdown
-    if(socket_arr[fd].shutdown_read || close_arr[socket_arr[fd].share_unit_index].client_write)
+    if(socket_arr[fd].shutdown_read || close_arr[socket_arr[fd].share_unit_index].client_write){
+        log_trace("read shutdown");
         return 0;
+    }
 
     // handle nonblocking flag
     if(socket_arr[fd].file_status_flags & O_NONBLOCK){
-        log_trace("non-blocking read");
+        //log_trace("non-blocking read");
         if(socket_arr[fd].request_queue->current_size == 0){
             errno = EWOULDBLOCK;
             log_trace("read EWOULDBLOCK");
@@ -864,8 +853,10 @@ ssize_t read(int fd, void *buf, size_t count){
             clock_gettime(CLOCK_REALTIME, &finish);
             sub_timespec(start, finish, &delta);
             log_info("read (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            //kill(getpid(), SIGKILL);
             return 0;
         }
+        usleep(1);
     }
     log_trace("start get lock");
     if(pthread_mutex_lock(socket_arr[fd].request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
@@ -887,12 +878,12 @@ ssize_t read(int fd, void *buf, size_t count){
 }
 
 ssize_t write(int fd, const void *buf, size_t count){
+    if(!is_valid_fd(fd))
+        return original_write(fd, buf, count);
+    
     struct timespec start, finish, delta;
     clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook write(), fd=%d, count=%ld", fd, count);
-    if(!is_valid_fd(fd))
-        return original_write(fd, buf, count);
-
     // my_log_hex(buf, count);
     // deal with shutdown
     if(socket_arr[fd].shutdown_write)
@@ -913,31 +904,35 @@ ssize_t write(int fd, const void *buf, size_t count){
             log_trace("write raise SIGPIPE");
             raise(SIGPIPE);
         }
+        usleep(1);
     }
 
     if(pthread_mutex_lock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
     ssize_t my_count = 0;
     my_count = stream_enqueue(shm_ptr, socket_arr[fd].response_queue, (char *)buf, count);
     if(pthread_mutex_unlock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
-    clock_gettime(CLOCK_REALTIME, &finish);
+    clock_gettime(CLOCK_REALTIME, &finish);  
+    sub_timespec(hook_start_time, finish, &delta);
+    log_info("write relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
+    log_info("write clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
     sub_timespec(start, finish, &delta);
     log_info("write (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     return my_count;
 }
 
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen){
-    log_trace("hook setsockopt(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_setsockopt(sockfd, level, optname, optval, optlen);
 
+    log_trace("hook setsockopt(), fd=%d", sockfd);
     return 0;
 }
 
 int getsockopt(int sockfd, int level, int optname, void *restrict optval, socklen_t *restrict optlen){
-    log_trace("hook getsockopt(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd))
         return original_getsockopt(sockfd, level, optname, optval, optlen);
-
+    
+    log_trace("hook getsockopt(), fd=%d", sockfd);
     return 0;
 }
 
@@ -989,7 +984,6 @@ int fcntl(int fd, int cmd, ...){
 }
 
 int fcntl64(int fd, int cmd, ...){
-    log_trace("hook fcntl64(), fd=%d", fd);
     va_list ap;
     va_start(ap, cmd);
     int flags;
@@ -1016,6 +1010,7 @@ int fcntl64(int fd, int cmd, ...){
         }
     }
     else{
+        log_trace("hook fcntl64(), fd=%d", fd);
         switch(cmd){
             case F_GETFL:
                 va_end(ap);
@@ -1036,7 +1031,6 @@ int fcntl64(int fd, int cmd, ...){
 }
 
 int ioctl(int fd, unsigned long request, ...){
-    log_trace("hook ioctl(), fd=%d", fd);
     va_list ap;
     va_start(ap, request);
     if(!is_valid_fd(fd)){
@@ -1062,46 +1056,46 @@ int ioctl(int fd, unsigned long request, ...){
                 return original_ioctl(fd, request, arp);
         }
     }
-
+    log_trace("hook ioctl(), fd=%d", fd);
     va_end(ap);
     return 0;
 }
 
 ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, struct sockaddr *restrict address, socklen_t *restrict address_len){
-    log_trace("hook recvfrom()!");
     if(!is_valid_fd(socket))
         return original_recvfrom(socket, buffer, length, flags, address, address_len);
     else{
+        log_trace("hook recvfrom()!");
         log_fatal("recvfrom not implement this part");
         exit(999);
     }
 }
 
 ssize_t sendto(int socket, const void *message, size_t length, int flags, const struct sockaddr *dest_addr, socklen_t dest_len){
-    log_trace("hook sendto()!");
     if(!is_valid_fd(socket))
         return original_sendto(socket, message, length, flags, dest_addr, dest_len);
     else{
+        log_trace("hook sendto()!");
         log_fatal("sendto not implement this part");
         exit(999);
     }
 }
 
 ssize_t recvmsg(int socket, struct msghdr *message, int flags){
-    log_trace("hook recvmsg()!");
     if(!is_valid_fd(socket))
         return original_recvmsg(socket, message, flags);
     else{
+        log_trace("hook recvmsg()!");
         log_fatal("recvmsg not implement this part");
         exit(999);
     }
 }
 
 ssize_t sendmsg(int socket, const struct msghdr *message, int flags){
-    log_trace("hook sendmsg()!");
     if(!is_valid_fd(socket))
         return original_sendmsg(socket, message, flags);
     else{
+        log_trace("hook sendmsg()!");
         log_fatal("sendmsg not implement this part");
         exit(999);
     }
@@ -1243,6 +1237,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
                 log_info("poll (hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
                 return hook_rv+poll_arg.rv;
             }
+            usleep(1);
         } while(pthread_tryjoin_np(tid, NULL) != 0);
 
         if(poll_arg.rv == -1){
@@ -1282,7 +1277,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
         .cond = &done
     };
     
-    clock_gettime(CLOCK_REALTIME, &abs_time);
+    //clock_gettime(CLOCK_REALTIME, &abs_time);
     abs_time.tv_sec += (time_t)(timeout / 1000);
     abs_time.tv_nsec += (long)(timeout % 1000) * 1000000;
     pthread_mutex_lock(&polling);
