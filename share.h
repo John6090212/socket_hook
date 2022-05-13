@@ -9,6 +9,7 @@
 #define DATAGRAM_QUEUE_CAPACITY 20
 #define CONNECT_QUEUE_CAPACITY 20
 #define ACCEPT_QUEUE_CAPACITY 10
+#define INT_QUEUE_CAPACITY 7520
 // share memory size for share unit
 #define COMMUNICATE_SHM_SIZE 0x400000
 // share memory size for connect and accept 
@@ -16,7 +17,7 @@
 // share memory size for close
 #define CLOSE_SHM_SIZE 0x4000
 // share queue number in share memory, an upper bound of max connections at a time of server
-#define SOCKET_NUM 10
+#define SOCKET_NUM 5
 
 // share memory for socket communication 
 int shm_fd;

@@ -118,6 +118,48 @@ message_t *datagram_dequeue(void *shm, share_queue *q){
     return m;    
 }
 
+int int_enqueue(void *shm, share_queue *q, int m){
+    int *m_arr = (int *)(shm+q->message_start_offset);
+    // queue is full
+    if (q->current_size == q->capacity){
+        return -1;
+    }
+    // queue is empty
+    if(q->front == -1){
+        q->front = q->rear = 0;
+        m_arr[q->rear] = m;
+    }
+    // normal condition
+    else{
+        q->rear = (q->rear + 1) % q->capacity;
+        m_arr[q->rear] = m;
+    }
+    q->current_size++;
+
+    return 0;
+}
+
+int int_dequeue(void *shm, share_queue *q){
+    int *m_arr = (int *)(shm+q->message_start_offset);
+    int m;
+    if(q->front == -1)
+        return -1;
+    
+    m = m_arr[q->front];
+    // reset front and rear if queue becomes empty
+    if(q->front == q->rear){
+        q->front = -1;
+        q->rear = -1;
+    }
+    // normal condition
+    else
+        q->front = (q->front + 1) % q->capacity;
+    
+    q->current_size--;
+
+    return m;    
+}
+
 // need to fix later
 void display_queue(void *shm){
     share_queue *q = (share_queue *)shm;

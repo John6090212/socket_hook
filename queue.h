@@ -55,6 +55,7 @@ typedef struct acception acception;
 struct acception{
     int client_fd;
     int share_unit_index;
+    int response_su_index;
 };
 
 typedef struct accept_queue accept_queue;

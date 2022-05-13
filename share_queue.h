@@ -33,4 +33,7 @@ buffer *stream_dequeue(void *shm, share_queue *q, int len);
 int datagram_enqueue(void *shm, share_queue *q, message_t m);
 message_t *datagram_dequeue(void *shm, share_queue *q);
 
+int int_enqueue(void *shm, share_queue *q, int m);
+int int_dequeue(void *shm, share_queue *q);
+
 #endif

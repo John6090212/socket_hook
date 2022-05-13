@@ -84,6 +84,9 @@ Stack *available_share_unit;
 mysocket socket_arr[1024];
 // fd for logging
 int log_fd;
+// for signal handler
+bool poll_timeout;
+timer_t poll_timer;
 struct timespec hook_start_time;
 
 // struct for pthread_create argument
@@ -143,7 +146,67 @@ int cmp_addr(const struct sockaddr *a, const struct sockaddr *b){
         return 1;
 }
 
-void init_share_queue(int i){
+// poll timer
+void my_signal_handler(int signum){
+    if(signum == SIGRTMIN){
+        __sync_val_compare_and_swap(&poll_timeout, false, true);
+    }
+}
+
+int my_createtimer(timer_t *timer){
+    struct sigevent evp = (struct sigevent){
+        .sigev_value.sival_ptr = timer,
+        .sigev_notify = SIGEV_SIGNAL,
+        .sigev_signo = SIGRTMIN
+    };
+
+    return timer_create(CLOCK_REALTIME, &evp, timer);
+}
+
+int my_poll_settimer(int timeout){
+    timer_t timer = poll_timer;
+    
+    struct itimerspec new_value = (struct itimerspec){
+        .it_interval = (struct timespec){
+            .tv_sec = 0,
+            .tv_nsec = 0
+        },
+        .it_value = (struct timespec){
+            .tv_sec = (time_t)(timeout / 1000),
+            .tv_nsec = (long)(timeout % 1000) * 1000000
+        }
+    };
+
+    if(timer_settime(timer, 0, &new_value, NULL) == -1){
+        log_error("poll settimer failed, %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+int my_poll_stoptimer(void){
+    timer_t timer = poll_timer;
+
+    struct itimerspec new_value = (struct itimerspec){
+        .it_interval = (struct timespec){
+            .tv_sec = 0,
+            .tv_nsec = 0
+        },
+        .it_value = (struct timespec){
+            .tv_sec = 0,
+            .tv_nsec = 0
+        }
+    };    
+    if(timer_settime(timer, TIMER_ABSTIME, &new_value, NULL) == -1){
+        log_error("poll stoptimer failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+void init_share_queue(int i, bool is_stream){
     //initialize mutex attr
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -151,10 +214,11 @@ void init_share_queue(int i){
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
 
+    int share_capacity = is_stream ? STREAM_QUEUE_CAPACITY : INT_QUEUE_CAPACITY;
     share_queue req_queue = (share_queue){
         .front = -1,
         .rear = -1,
-        .capacity = STREAM_QUEUE_CAPACITY,
+        .capacity = share_capacity,
         .current_size = 0,
         .message_start_offset = (i+1)*2*sizeof(share_queue)+(i+1)*2*sizeof(pthread_mutex_t)+i*2*STREAM_QUEUE_CAPACITY
     };
@@ -163,7 +227,7 @@ void init_share_queue(int i){
     share_queue res_queue = (share_queue){
         .front = -1,
         .rear = -1,
-        .capacity = STREAM_QUEUE_CAPACITY,
+        .capacity = share_capacity,
         .current_size = 0,
         .message_start_offset = (i+1)*2*sizeof(share_queue)+(i+1)*2*sizeof(pthread_mutex_t)+(i*2+1)*STREAM_QUEUE_CAPACITY
     };
@@ -224,6 +288,7 @@ int init_socket(int fd, int domain, int type, int protocol){
         .msg_more_buf = NULL,
         .msg_more_size = 0,
         .share_unit_index = -1,
+        .response_su_index = -1,
         .file_status_flags = 0,
         .pollfds_index = -1,
         .is_accept_fd = 0,
@@ -231,14 +296,25 @@ int init_socket(int fd, int domain, int type, int protocol){
     };
     socket_arr[fd].share_unit_index = pop(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
-        log_fatal("need to increase SOCK_NUM\n");
+        log_fatal("need to increase SOCK_NUM");
         return -1;
     }
-    init_share_queue(socket_arr[fd].share_unit_index);
+    init_share_queue(socket_arr[fd].share_unit_index, true);
     socket_arr[fd].request_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_queue);
     socket_arr[fd].response_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_queue);
     socket_arr[fd].request_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_lock);
     socket_arr[fd].response_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_lock);
+    
+    // init share unit for response size
+    socket_arr[fd].response_su_index = pop(available_share_unit);
+    if(socket_arr[fd].response_su_index == INT_MIN){
+        log_fatal("need to increase SOCK_NUM");
+        return -1;
+    }
+    init_share_queue(socket_arr[fd].response_su_index, false);
+    socket_arr[fd].res_len_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].response_su_index].request_queue);
+    socket_arr[fd].res_queue_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].response_su_index].request_lock);
+    
     return 0;
 }
 
@@ -343,7 +419,7 @@ __attribute__((constructor)) void init(){
 
     // initialize request/response queue
     for(int i = 0; i < SOCKET_NUM; i++){
-        init_share_queue(i);
+        init_share_queue(i, true);
     }
 
     // initialize close share memory
@@ -360,6 +436,10 @@ __attribute__((constructor)) void init(){
     }
     memset(close_shm_ptr, 0, CLOSE_SHM_SIZE);
     close_arr = (close_unit *)close_shm_ptr;
+
+    poll_timeout = false;
+    poll_timer = NULL;
+    signal(SIGRTMIN, my_signal_handler);
 }
 
 int is_valid_fd(int sockfd){
@@ -412,10 +492,10 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
 }
 
 int listen(int sockfd, int backlog){
-    log_trace("hook listen(), fd=%d", sockfd);
     if(!is_valid_fd(sockfd)){
         return original_listen(sockfd, backlog);
     }
+    log_trace("hook listen(), fd=%d", sockfd);
     // for poll
     socket_arr[sockfd].is_accept_fd = 1;
 
@@ -446,9 +526,9 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     socket_arr[fd].is_server = 1;
 
     // save bind address to share memory
-    if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
+    if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM && socket_arr[fd].response_su_index >= 0 && socket_arr[fd].response_su_index < SOCKET_NUM){
         while(connect_queue_ptr->size == 0)
-            usleep(1);
+            usleep(0);
         if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
         connection *c = Connect_dequeue(connect_shm_ptr, connect_queue_ptr);
         if(pthread_mutex_unlock(connect_lock) != 0) log_error("pthread_mutex_unlock connect_lock failed");
@@ -457,13 +537,14 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
             if(cmp_addr(&socket_arr[sockfd].addr, &(c->addr))){
                 acception a = (acception){
                     .client_fd = c->client_fd,
-                    .share_unit_index = socket_arr[fd].share_unit_index
+                    .share_unit_index = socket_arr[fd].share_unit_index,
+                    .response_su_index = socket_arr[fd].response_su_index
                 };
                 
                 // init close unit before client accept
                 init_close_unit(socket_arr[fd].share_unit_index);
                 while(accept_queue_ptr->size == accept_queue_ptr->capacity)
-                    usleep(1);
+                    usleep(0);
                 if(pthread_mutex_lock(accept_lock) != 0) log_error("pthread_mutex_lock accept_lock failed");
                 if(Accept_enqueue(connect_shm_ptr, accept_queue_ptr, a) == -1)
                     log_error("accept queue enqueue failed");
@@ -566,7 +647,12 @@ int shutdown(int sockfd, int how){
             close_arr[socket_arr[sockfd].share_unit_index].server_read = 1;
             close_arr[socket_arr[sockfd].share_unit_index].server_write = 1;
         }
-    }   
+    }
+    struct timespec finish, delta;
+    clock_gettime(CLOCK_REALTIME, &finish);  
+    sub_timespec(hook_start_time, finish, &delta);
+    log_info("shutdown relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
+    log_info("shutdown clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);   
 
     return 0;
 }
@@ -604,7 +690,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
         while(socket_arr[sockfd].request_queue->current_size == 0){
             if(close_arr[socket_arr[sockfd].share_unit_index].client_write)
                 return 0;
-            usleep(1);
+            usleep(0);
         }
 
         if(pthread_mutex_lock(socket_arr[sockfd].request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
@@ -667,7 +753,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
     while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity){
         if(close_arr[socket_arr[sockfd].share_unit_index].client_read)
             raise(SIGPIPE);
-        usleep(1);
+        usleep(0);
     }
 
     ssize_t count = 0;
@@ -711,7 +797,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
                 }
                 else{
                     while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity)
-                        usleep(1);
+                        usleep(0);
 
                     if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
                     if(i == send_times - 1) 
@@ -750,7 +836,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
                 }
                 else{
                     while(socket_arr[sockfd].response_queue->current_size == socket_arr[sockfd].response_queue->capacity)
-                        usleep(1);
+                        usleep(0);
 
                     if(pthread_mutex_lock(socket_arr[sockfd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
                     if(i == send_times - 1) 
@@ -856,7 +942,7 @@ ssize_t read(int fd, void *buf, size_t count){
             //kill(getpid(), SIGKILL);
             return 0;
         }
-        usleep(1);
+        usleep(0);
     }
     log_trace("start get lock");
     if(pthread_mutex_lock(socket_arr[fd].request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
@@ -904,13 +990,20 @@ ssize_t write(int fd, const void *buf, size_t count){
             log_trace("write raise SIGPIPE");
             raise(SIGPIPE);
         }
-        usleep(1);
+        usleep(0);
     }
 
     if(pthread_mutex_lock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
     ssize_t my_count = 0;
     my_count = stream_enqueue(shm_ptr, socket_arr[fd].response_queue, (char *)buf, count);
     if(pthread_mutex_unlock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
+    
+    while(socket_arr[fd].res_len_queue->current_size == socket_arr[fd].res_len_queue->capacity)
+        usleep(0);
+    if(pthread_mutex_lock(socket_arr[fd].res_queue_lock) != 0) log_error("pthread_mutex_lock res_queue_lock failed");
+    if(int_enqueue(shm_ptr, socket_arr[fd].res_len_queue, my_count) == -1)
+        log_error("int_enqueue failed");
+    if(pthread_mutex_unlock(socket_arr[fd].res_queue_lock) != 0) log_error("pthread_mutex_unlock res_queue_lock failed");
     clock_gettime(CLOCK_REALTIME, &finish);  
     sub_timespec(hook_start_time, finish, &delta);
     log_info("write relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
@@ -1109,6 +1202,12 @@ int hook_fd_poll(struct pollfd *fds, nfds_t nfds){
         // clear revents
         fds[i].revents = 0;
         fd = fds[i].fd;
+        if(socket_arr[fd].share_unit_index >= 0 && (close_arr[socket_arr[fd].share_unit_index].client_write || close_arr[socket_arr[fd].share_unit_index].client_read)){
+            fds[i].revents = fds[i].events;
+            rv++;
+            log_info("hook_fd_poll after client shutdown or close socket");
+            return rv;
+        }
         // check POLLIN meaning
         if(socket_arr[fd].is_accept_fd){
             if((fds[i].events & POLLIN) && connect_queue_ptr->size > 0){
@@ -1136,32 +1235,6 @@ int hook_fd_poll(struct pollfd *fds, nfds_t nfds){
     return rv;
 }
 
-void *call_poll(void *argument){
-    args *poll_arg = (args *)argument;
-
-    int oldtype;
-    /* allow the thread to be killed at any time */
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-
-    poll_arg->rv = original_poll(poll_arg->fds, poll_arg->nfds, poll_arg->timeout);
-
-    pthread_exit(NULL);
-    return NULL;
-}
-
-void *call_hook_fd_poll(void *argument){
-    hook_args *hook_poll_arg = (hook_args *)argument;
-
-    int oldtype;
-    /* allow the thread to be killed at any time */
-    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-    while(hook_poll_arg->rv == 0)
-        hook_poll_arg->rv = hook_fd_poll(hook_poll_arg->fds, hook_poll_arg->nfds);
-
-    pthread_cond_signal(hook_poll_arg->cond);
-    return NULL;
-}
-
 nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
     nfds_t hook_nfds = 0;
     for(int i = 0; i < nfds; i++){
@@ -1174,14 +1247,14 @@ nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
 int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     struct timespec start, finish, delta;
     clock_gettime(CLOCK_REALTIME, &start);
-    log_trace("hook poll()!");
+    log_trace("hook poll(), nfds=%ld, timeout=%d", nfds, timeout);
     int rv = 0, hook_rv = 0;
     struct timespec abs_time;
     int err;
     pthread_t tid;
     // save nfds for hook fd in poll
     nfds_t hook_nfds = get_hook_nfds(fds, nfds);
-    // log_debug("hook_nfds: %ld", hook_nfds);
+    log_debug("hook_nfds: %ld", hook_nfds);
 
     if(!USE_DNSMASQ_POLL){
         log_fatal("not implement yet");
@@ -1200,65 +1273,92 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
         // log_debug("hook_rv: %d", hook_rv);
         return rv+hook_rv;
     }
-    
+
+
     // timeout > 0 or timeout < 0
-    if(nfds-hook_nfds > 0){   
-        args poll_arg = (args) {
-            .fds = fds,
-            .nfds = nfds-hook_nfds,
-            .timeout = timeout,
-            .rv = 0
-        };
-        
-        pthread_create(&tid, NULL, call_poll, (void *)&poll_arg);
-        do {
-            if(hook_nfds > 0)
-                hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
+    if(nfds-hook_nfds > 0){
+        if(timeout > 0){
+            if(poll_timer == NULL && my_createtimer(&poll_timer) == -1){
+                log_error("poll_timer create failed");
+                return -1;
+            }
+
+            poll_timeout = false;
+            if(my_poll_settimer(timeout) == -1)
+                return -1;
+        }
+
+        while(1){
+            hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
             if(hook_rv > 0){
-                // log_debug("hook_rv: %d", hook_rv);
-                if(pthread_tryjoin_np(tid, NULL) != 0){
-                    // log_debug("normal poll blocking");
-                    pthread_cancel(tid);
-                    clock_gettime(CLOCK_REALTIME, &finish);
-                    sub_timespec(start, finish, &delta);
-                    log_info("poll (hook+ n-) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-                    return hook_rv;
-                }
-                    
-                if(poll_arg.rv == -1){
-                    clock_gettime(CLOCK_REALTIME, &finish);
-                    sub_timespec(start, finish, &delta);
-                    log_info("poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                log_debug("hook_rv: %d", hook_rv);
+                if(timeout > 0 && my_poll_stoptimer() == -1)
                     return -1;
+                
+                rv = original_poll(fds, nfds-hook_nfds, 0);
+
+                if(rv == -1){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    return rv;
                 }
-                // log_debug("poll rv: %d", poll_arg.rv);
+
+                log_debug("poll rv: %d", rv);
                 clock_gettime(CLOCK_REALTIME, &finish);
                 sub_timespec(start, finish, &delta);
                 log_info("poll (hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-                return hook_rv+poll_arg.rv;
+                return hook_rv+rv;               
             }
-            usleep(1);
-        } while(pthread_tryjoin_np(tid, NULL) != 0);
 
-        if(poll_arg.rv == -1){
-            clock_gettime(CLOCK_REALTIME, &finish);
-            sub_timespec(start, finish, &delta);
-            log_info("poll (join n-) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-            return -1;
+            rv = original_poll(fds, nfds-hook_nfds, 0);
+            if(rv == -1){
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                return rv;
+            }
+            else if(rv > 0){
+                log_debug("poll rv: %d", rv);
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                return hook_rv+rv;
+            }            
+
+            if(__sync_bool_compare_and_swap(&poll_timeout, true, true)){
+                poll_timeout = 0;
+
+                rv = original_poll(fds, nfds-hook_nfds, 0);
+                if(rv == -1){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    return rv;
+                }
+
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(hook_start_time, finish, &delta);
+                log_info("poll relative time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                log_info("poll clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
+                sub_timespec(start, finish, &delta);
+                if(rv == 0)
+                    log_info("poll (timeout) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);                                
+                else
+                    log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                return hook_rv+rv;
+            }
+            usleep(0);
         }
-        // log_debug("hook_rv: %d", hook_rv);
-        // log_debug("poll rv: %d", poll_arg.rv);
-        clock_gettime(CLOCK_REALTIME, &finish);
-        sub_timespec(start, finish, &delta);
-        log_info("poll (join hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-        return hook_rv+poll_arg.rv;
     }
 
     // no original poll
     if(timeout == -1){
         // log_debug("timeout is -1");
-        while(!hook_rv)
+        while(!hook_rv){
             hook_rv = hook_fd_poll(&fds[nfds-hook_nfds], hook_nfds);
+            usleep(0);
+        }
 
         clock_gettime(CLOCK_REALTIME, &finish);
         sub_timespec(start, finish, &delta);
@@ -1267,38 +1367,32 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     }
     
     // no original poll and timeout > 0
-    pthread_mutex_t polling = PTHREAD_MUTEX_INITIALIZER;
-    pthread_cond_t done = PTHREAD_COND_INITIALIZER;
-    hook_args hook_poll_arg = (hook_args) {
-        .fds = fds,
-        .nfds = hook_nfds,
-        .rv = 0,
-        .mutex = &polling,
-        .cond = &done
-    };
-    
-    //clock_gettime(CLOCK_REALTIME, &abs_time);
-    abs_time.tv_sec += (time_t)(timeout / 1000);
-    abs_time.tv_nsec += (long)(timeout % 1000) * 1000000;
-    pthread_mutex_lock(&polling);
-
-    pthread_create(&tid, NULL, call_hook_fd_poll, (void *)&hook_poll_arg);
-    err = pthread_cond_timedwait(&done, &polling, &abs_time);
-    pthread_mutex_unlock(&polling);
-    
-    if(err == ETIMEDOUT){
-        // printf("pthread timeout\n");
-        pthread_cancel(tid);
-        clock_gettime(CLOCK_REALTIME, &finish);
-        sub_timespec(start, finish, &delta);
-        log_info("only hook fd poll timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-        return 0;
+    if(poll_timer == NULL && my_createtimer(&poll_timer) == -1){
+        log_error("poll_timer create failed");
+        return -1;
     }
 
-    pthread_join(tid, NULL);
-    // printf("pthread normal return\n");
+    poll_timeout = false;
+    if(my_poll_settimer(timeout) == -1)
+        return -1;
+
+    while(!hook_rv){
+        hook_rv = hook_fd_poll(fds, hook_nfds);
+        if(__sync_bool_compare_and_swap(&poll_timeout, true, true)){
+            poll_timeout = false;
+            clock_gettime(CLOCK_REALTIME, &finish);
+            sub_timespec(start, finish, &delta);
+            log_info("only hook fd poll timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            return 0;
+        }
+        usleep(0);
+    }
+
+    if(my_poll_stoptimer() == -1)
+        return -1;
+
     clock_gettime(CLOCK_REALTIME, &finish);
     sub_timespec(start, finish, &delta);
     log_info("only hook fd poll time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-    return hook_poll_arg.rv;
+    return hook_rv;
 }
