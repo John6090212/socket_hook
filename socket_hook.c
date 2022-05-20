@@ -38,6 +38,8 @@
 // timer in poll
 #include <sys/timerfd.h>
 #include <stdint.h>
+// control socket
+#include <sys/un.h>
 
 #include "share_queue.h"
 #include "queue.h"
@@ -49,6 +51,8 @@
 #include "log.h"
 
 #define USE_DNSMASQ_POLL 1
+#define CONTROL_SOCKET_NAME "/tmp/control_sock"
+#define PROFILING_TIME 0
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -75,6 +79,7 @@ ssize_t (*original_sendto)(int socket, const void *message, size_t length, int f
 ssize_t (*original_recvmsg)(int socket, struct msghdr *message, int flags);
 ssize_t (*original_sendmsg)(int socket, const struct msghdr *message, int flags);
 int (*original_poll)(struct pollfd *fds, nfds_t nfds, int timeout);
+pid_t (*original_fork)(void);
 
 // queue to acquire available fd
 Stack *available_fd;
@@ -88,6 +93,12 @@ int log_fd;
 bool poll_timeout;
 timer_t poll_timer;
 struct timespec hook_start_time;
+// for control socket
+int read_count;
+// for smart affinity
+int aflnet_cpu_id;
+int next_cpu_id;
+int cpu_count;
 
 // struct for pthread_create argument
 typedef struct args args;
@@ -214,7 +225,7 @@ void init_share_queue(int i, bool is_stream){
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
 
-    int share_capacity = is_stream ? STREAM_QUEUE_CAPACITY : INT_QUEUE_CAPACITY;
+    int share_capacity = is_stream ? STREAM_QUEUE_CAPACITY : DATAGRAM_QUEUE_CAPACITY;
     share_queue req_queue = (share_queue){
         .front = -1,
         .rear = -1,
@@ -288,11 +299,11 @@ int init_socket(int fd, int domain, int type, int protocol){
         .msg_more_buf = NULL,
         .msg_more_size = 0,
         .share_unit_index = -1,
-        .response_su_index = -1,
         .file_status_flags = 0,
         .pollfds_index = -1,
         .is_accept_fd = 0,
-        .is_server = 0
+        .is_server = 0,
+        .control_sock = -1
     };
     socket_arr[fd].share_unit_index = pop(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
@@ -304,16 +315,6 @@ int init_socket(int fd, int domain, int type, int protocol){
     socket_arr[fd].response_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_queue);
     socket_arr[fd].request_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_lock);
     socket_arr[fd].response_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_lock);
-    
-    // init share unit for response size
-    socket_arr[fd].response_su_index = pop(available_share_unit);
-    if(socket_arr[fd].response_su_index == INT_MIN){
-        log_fatal("need to increase SOCK_NUM");
-        return -1;
-    }
-    init_share_queue(socket_arr[fd].response_su_index, false);
-    socket_arr[fd].res_len_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].response_su_index].request_queue);
-    socket_arr[fd].res_queue_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].response_su_index].request_lock);
     
     return 0;
 }
@@ -333,7 +334,8 @@ int init_close_unit(int share_unit_index){
 }
 
 __attribute__((constructor)) void init(){
-    clock_gettime(CLOCK_REALTIME, &hook_start_time);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &hook_start_time);
     // initialize function pointer before main function
     original_socket = dlsym(RTLD_NEXT, "socket");
     original_bind = dlsym(RTLD_NEXT, "bind");
@@ -359,6 +361,7 @@ __attribute__((constructor)) void init(){
     original_recvmsg = dlsym(RTLD_NEXT, "recvmsg");
     original_sendmsg = dlsym(RTLD_NEXT, "sendmsg");
     original_poll = dlsym(RTLD_NEXT, "poll");
+    original_fork = dlsym(RTLD_NEXT, "fork");
 
     // initialize logging
     log_set_quiet(true);
@@ -440,6 +443,16 @@ __attribute__((constructor)) void init(){
     poll_timeout = false;
     poll_timer = NULL;
     signal(SIGRTMIN, my_signal_handler);
+
+    read_count = 0;
+
+    // for smart affinity
+    cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    aflnet_cpu_id = sched_getcpu();
+    next_cpu_id = (aflnet_cpu_id + 1) % cpu_count;
+    log_trace("cpu_count: %d", cpu_count);
+    log_trace("aflnet_cpu_id: %d", aflnet_cpu_id);
+    log_trace("next_cpu_id: %d", next_cpu_id);
 }
 
 int is_valid_fd(int sockfd){
@@ -455,7 +468,8 @@ int socket(int domain, int type, int protocol){
         return original_socket(domain, type, protocol);
 
     struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook socket()!");
     int fd = pop(available_fd);
     if(fd == INT_MIN){
@@ -468,9 +482,11 @@ int socket(int domain, int type, int protocol){
         return -1;
     }
     log_trace("use self management fd: %d", fd);
-    clock_gettime(CLOCK_REALTIME, &finish);
-    sub_timespec(start, finish, &delta);
-    log_info("socket time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("socket time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return fd;
 }
 
@@ -508,7 +524,8 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     
     struct timespec start, finish, delta;
     int fd = 0;    
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook accept(), fd=%d", sockfd);
     if(socket_arr[sockfd].file_status_flags & O_NONBLOCK){
         if(connect_queue_ptr->size == 0){
@@ -526,7 +543,7 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     socket_arr[fd].is_server = 1;
 
     // save bind address to share memory
-    if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM && socket_arr[fd].response_su_index >= 0 && socket_arr[fd].response_su_index < SOCKET_NUM){
+    if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
         while(connect_queue_ptr->size == 0)
             usleep(0);
         if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
@@ -537,8 +554,7 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
             if(cmp_addr(&socket_arr[sockfd].addr, &(c->addr))){
                 acception a = (acception){
                     .client_fd = c->client_fd,
-                    .share_unit_index = socket_arr[fd].share_unit_index,
-                    .response_su_index = socket_arr[fd].response_su_index
+                    .share_unit_index = socket_arr[fd].share_unit_index
                 };
                 
                 // init close unit before client accept
@@ -580,9 +596,24 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     if(addr == NULL)
         free(fake_addr); 
 
-    clock_gettime(CLOCK_REALTIME, &finish);
-    sub_timespec(start, finish, &delta);
-    log_info("accept time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    // connect to control server
+    socket_arr[fd].control_sock = original_socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if(socket_arr[fd].control_sock == -1)
+        log_error("control socket create failed");
+
+    struct sockaddr_un serveraddr;
+    memset(&serveraddr, 0, sizeof(serveraddr));
+    serveraddr.sun_family = AF_UNIX;
+    strncpy(serveraddr.sun_path, CONTROL_SOCKET_NAME, sizeof(serveraddr.sun_path));
+    
+    if(original_connect(socket_arr[fd].control_sock, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) == -1)
+        log_error("control socket connect failed");
+    read_count = 0;
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("accept time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return fd;
 }
 
@@ -607,7 +638,8 @@ int close(int fd){
 
     log_trace("hook close(), fd=%d",fd);
     struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
 
     push(available_share_unit, socket_arr[fd].share_unit_index);
     // clear address in connect sockaddr array
@@ -616,12 +648,17 @@ int close(int fd){
         close_arr[socket_arr[fd].share_unit_index].server_read = 1;
         close_arr[socket_arr[fd].share_unit_index].server_write = 1;
     }
+    // close control socket
+    if(socket_arr[fd].control_sock != -1)
+        original_close(socket_arr[fd].control_sock);
     memset(&socket_arr[fd], 0, sizeof(mysocket));
     push(available_fd, fd);
 
-    clock_gettime(CLOCK_REALTIME, &finish);
-    sub_timespec(start, finish, &delta);
-    log_info("close time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("close time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return 0;   
 }
 
@@ -649,11 +686,12 @@ int shutdown(int sockfd, int how){
         }
     }
     struct timespec finish, delta;
-    clock_gettime(CLOCK_REALTIME, &finish);  
-    sub_timespec(hook_start_time, finish, &delta);
-    log_info("shutdown relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
-    log_info("shutdown clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);   
-
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);  
+        sub_timespec(hook_start_time, finish, &delta);
+        log_info("shutdown relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
+        log_info("shutdown clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);   
+    }
     return 0;
 }
 
@@ -916,12 +954,27 @@ ssize_t read(int fd, void *buf, size_t count){
         return original_read(fd, buf, count);
 
     struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook read(), fd=%d, count=%ld", fd, count);
     // deal with shutdown
     if(socket_arr[fd].shutdown_read || close_arr[socket_arr[fd].share_unit_index].client_write){
         log_trace("read shutdown");
         return 0;
+    }
+
+    // deal with dnsmasq malformed packet
+    read_count++;
+    log_trace("control socket read_count=%d", read_count);
+    if(read_count == 4){
+        log_trace("send malformed to control server");
+        // send message through control socket
+        const char control_buf[] = "malformed";
+        ssize_t n;
+        if((n = original_send(socket_arr[fd].control_sock, control_buf, sizeof(control_buf), MSG_NOSIGNAL)) <= 0){
+            log_error("control socket send malformed failed, n=%d", n);
+        } 
+        read_count = 1;
     }
 
     // handle nonblocking flag
@@ -936,10 +989,11 @@ ssize_t read(int fd, void *buf, size_t count){
     log_trace("start blocking");
     while(__sync_bool_compare_and_swap(&socket_arr[fd].request_queue->current_size, 0, 0)){
         if(__sync_fetch_and_add(&close_arr[socket_arr[fd].share_unit_index].client_write, 0)){
-            clock_gettime(CLOCK_REALTIME, &finish);
-            sub_timespec(start, finish, &delta);
-            log_info("read (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-            //kill(getpid(), SIGKILL);
+            if(PROFILING_TIME){
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("read (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            }
             return 0;
         }
         usleep(0);
@@ -957,9 +1011,11 @@ ssize_t read(int fd, void *buf, size_t count){
     if(pthread_mutex_unlock(socket_arr[fd].request_lock) != 0) log_error("pthread_mutex_unlock request_lock failed");
     // my_log_hex(buf, my_count);
     log_trace("read return %ld", my_count);
-    clock_gettime(CLOCK_REALTIME, &finish);
-    sub_timespec(start, finish, &delta);
-    log_info("read (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("read (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return my_count;
 }
 
@@ -968,7 +1024,8 @@ ssize_t write(int fd, const void *buf, size_t count){
         return original_write(fd, buf, count);
     
     struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook write(), fd=%d, count=%ld", fd, count);
     // my_log_hex(buf, count);
     // deal with shutdown
@@ -984,9 +1041,11 @@ ssize_t write(int fd, const void *buf, size_t count){
     }
     while(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity){
         if(close_arr[socket_arr[fd].share_unit_index].client_read){
-            clock_gettime(CLOCK_REALTIME, &finish);
-            sub_timespec(start, finish, &delta);
-            log_info("write (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            if(PROFILING_TIME){
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("write (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            }
             log_trace("write raise SIGPIPE");
             raise(SIGPIPE);
         }
@@ -998,18 +1057,22 @@ ssize_t write(int fd, const void *buf, size_t count){
     my_count = stream_enqueue(shm_ptr, socket_arr[fd].response_queue, (char *)buf, count);
     if(pthread_mutex_unlock(socket_arr[fd].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
     
-    while(socket_arr[fd].res_len_queue->current_size == socket_arr[fd].res_len_queue->capacity)
-        usleep(0);
-    if(pthread_mutex_lock(socket_arr[fd].res_queue_lock) != 0) log_error("pthread_mutex_lock res_queue_lock failed");
-    if(int_enqueue(shm_ptr, socket_arr[fd].res_len_queue, my_count) == -1)
-        log_error("int_enqueue failed");
-    if(pthread_mutex_unlock(socket_arr[fd].res_queue_lock) != 0) log_error("pthread_mutex_unlock res_queue_lock failed");
-    clock_gettime(CLOCK_REALTIME, &finish);  
-    sub_timespec(hook_start_time, finish, &delta);
-    log_info("write relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
-    log_info("write clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
-    sub_timespec(start, finish, &delta);
-    log_info("write (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    // send message through control socket
+    log_trace("send after_write to control server");
+    const char control_buf[] = "after_write";
+    ssize_t n;
+    if((n = original_send(socket_arr[fd].control_sock, control_buf, sizeof(control_buf), MSG_NOSIGNAL)) <= 0){
+        log_error("control socket send normal failed, n=%d, %s",n , strerror(errno));
+    }
+    read_count = 0;
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);  
+        sub_timespec(hook_start_time, finish, &delta);
+        log_info("write relative time: %lld.%.9ld", delta.tv_sec, delta.tv_nsec);
+        log_info("write clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
+        sub_timespec(start, finish, &delta);
+        log_info("write (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return my_count;
 }
 
@@ -1246,12 +1309,10 @@ nfds_t get_hook_nfds(struct pollfd *fds, nfds_t nfds){
 
 int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     struct timespec start, finish, delta;
-    clock_gettime(CLOCK_REALTIME, &start);
+    if(PROFILING_TIME)
+        clock_gettime(CLOCK_REALTIME, &start);
     log_trace("hook poll(), nfds=%ld, timeout=%d", nfds, timeout);
     int rv = 0, hook_rv = 0;
-    struct timespec abs_time;
-    int err;
-    pthread_t tid;
     // save nfds for hook fd in poll
     nfds_t hook_nfds = get_hook_nfds(fds, nfds);
     log_debug("hook_nfds: %ld", hook_nfds);
@@ -1298,31 +1359,39 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
                 rv = original_poll(fds, nfds-hook_nfds, 0);
 
                 if(rv == -1){
-                    clock_gettime(CLOCK_REALTIME, &finish);
-                    sub_timespec(start, finish, &delta);
-                    log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    if(PROFILING_TIME){
+                        clock_gettime(CLOCK_REALTIME, &finish);
+                        sub_timespec(start, finish, &delta);
+                        log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    }
                     return rv;
                 }
 
                 log_debug("poll rv: %d", rv);
-                clock_gettime(CLOCK_REALTIME, &finish);
-                sub_timespec(start, finish, &delta);
-                log_info("poll (hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                if(PROFILING_TIME){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("poll (hook+ n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                }
                 return hook_rv+rv;               
             }
 
             rv = original_poll(fds, nfds-hook_nfds, 0);
             if(rv == -1){
-                clock_gettime(CLOCK_REALTIME, &finish);
-                sub_timespec(start, finish, &delta);
-                log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                if(PROFILING_TIME){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                }
                 return rv;
             }
             else if(rv > 0){
                 log_debug("poll rv: %d", rv);
-                clock_gettime(CLOCK_REALTIME, &finish);
-                sub_timespec(start, finish, &delta);
-                log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                if(PROFILING_TIME){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(start, finish, &delta);
+                    log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                }
                 return hook_rv+rv;
             }            
 
@@ -1331,21 +1400,25 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
 
                 rv = original_poll(fds, nfds-hook_nfds, 0);
                 if(rv == -1){
-                    clock_gettime(CLOCK_REALTIME, &finish);
-                    sub_timespec(start, finish, &delta);
-                    log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    if(PROFILING_TIME){
+                        clock_gettime(CLOCK_REALTIME, &finish);
+                        sub_timespec(start, finish, &delta);
+                        log_info("origin poll (n error) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    }
                     return rv;
                 }
 
-                clock_gettime(CLOCK_REALTIME, &finish);
-                sub_timespec(hook_start_time, finish, &delta);
-                log_info("poll relative time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
-                log_info("poll clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
-                sub_timespec(start, finish, &delta);
-                if(rv == 0)
-                    log_info("poll (timeout) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);                                
-                else
-                    log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                if(PROFILING_TIME){
+                    clock_gettime(CLOCK_REALTIME, &finish);
+                    sub_timespec(hook_start_time, finish, &delta);
+                    log_info("poll relative time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                    log_info("poll clock time: %lld.%.9ld", finish.tv_sec, finish.tv_nsec);
+                    sub_timespec(start, finish, &delta);
+                    if(rv == 0)
+                        log_info("poll (timeout) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);                                
+                    else
+                        log_info("poll (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+                }
                 return hook_rv+rv;
             }
             usleep(0);
@@ -1360,9 +1433,11 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
             usleep(0);
         }
 
-        clock_gettime(CLOCK_REALTIME, &finish);
-        sub_timespec(start, finish, &delta);
-        log_info("poll (only hook fd infinite loop) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+        if(PROFILING_TIME){
+            clock_gettime(CLOCK_REALTIME, &finish);
+            sub_timespec(start, finish, &delta);
+            log_info("poll (only hook fd infinite loop) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+        }
         return hook_rv;
     }
     
@@ -1380,9 +1455,11 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
         hook_rv = hook_fd_poll(fds, hook_nfds);
         if(__sync_bool_compare_and_swap(&poll_timeout, true, true)){
             poll_timeout = false;
-            clock_gettime(CLOCK_REALTIME, &finish);
-            sub_timespec(start, finish, &delta);
-            log_info("only hook fd poll timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            if(PROFILING_TIME){
+                clock_gettime(CLOCK_REALTIME, &finish);
+                sub_timespec(start, finish, &delta);
+                log_info("only hook fd poll timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+            }
             return 0;
         }
         usleep(0);
@@ -1391,8 +1468,28 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     if(my_poll_stoptimer() == -1)
         return -1;
 
-    clock_gettime(CLOCK_REALTIME, &finish);
-    sub_timespec(start, finish, &delta);
-    log_info("only hook fd poll time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    if(PROFILING_TIME){
+        clock_gettime(CLOCK_REALTIME, &finish);
+        sub_timespec(start, finish, &delta);
+        log_info("only hook fd poll time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
+    }
     return hook_rv;
+}
+
+pid_t fork(void){
+    log_trace("hook fork!");
+    // change cpu affinity
+    cpu_set_t c;
+    CPU_ZERO(&c);
+    CPU_SET(next_cpu_id, &c);
+    if (sched_setaffinity(0, sizeof(c), &c))
+        log_error("sched_setaffinity failed");
+    log_trace("pin process to cpu %d", next_cpu_id);
+
+    //Update next_cpu_id
+    next_cpu_id = (next_cpu_id + 1) % cpu_count;
+    if(next_cpu_id == aflnet_cpu_id)
+        next_cpu_id = (next_cpu_id + 1) % cpu_count;
+
+    return original_fork();
 }

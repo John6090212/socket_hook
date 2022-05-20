@@ -32,10 +32,6 @@ struct mysocket {
     share_queue *response_queue;
     pthread_mutex_t *request_lock;
     pthread_mutex_t *response_lock;
-    // for aflnet response_bytes correction
-    int response_su_index;
-    share_queue *res_len_queue;
-    pthread_mutex_t *res_queue_lock;
     // GETFL and SETFL flags
     int file_status_flags;
     // for dnsmasq
@@ -43,6 +39,8 @@ struct mysocket {
     // for poll
     int is_accept_fd;
     int is_server;
+    // for control socket
+    int control_sock;
     // for socket timeout
     struct timeval send_timeout;
     struct timeval recv_timeout;
