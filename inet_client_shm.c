@@ -18,6 +18,7 @@
 #include <stdint.h>
 // for poll
 #include <poll.h>
+#include <sys/un.h>
 
 #include "share_queue.h"
 #include "socket.h"
@@ -25,8 +26,11 @@
 #include "queue.h"
 #include "log.h"
   
-#define BUF_SIZE 100
-#define ROUND_TIME 2
+#define BUF_SIZE 200
+#define ROUND_TIME 7
+#define CONTROL_BUF_LEN 25
+#define USE_UDP 1
+#define TEST_SERVER 0
 
 // print char array in hex
 void my_print_hex(char *m, int length){
@@ -36,7 +40,19 @@ void my_print_hex(char *m, int length){
     printf("\n");
 }
 
+static unsigned long long get_cur_time(void) {
+
+  struct timeval tv;
+  struct timezone tz;
+
+  gettimeofday(&tv, &tz);
+
+  return (tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
+
+}
+
 mysocket socket_cli;
+char *control_sock_name;
 
 void my_signal_handler(int signum){
     if(signum == SIGUSR2){
@@ -162,13 +178,23 @@ ssize_t my_recv(int sockfd, void *buf, size_t len, int flags){
 
     if(pthread_mutex_lock(socket_cli.response_lock) != 0) log_error("pthread_mutex_lock response_lock failed");
     ssize_t count = 0;
-    buffer *b = stream_dequeue(shm_ptr, socket_cli.response_queue, len);
-    if(b->buf != NULL){
-        memcpy(buf, b->buf, b->length *sizeof(char));
-        count = b->length;
-        free(b->buf); 
+    if(socket_cli.type == SOCK_DGRAM){
+        message_t *m = datagram_dequeue(shm_ptr, socket_cli.response_queue);
+        if(m->length != 0){
+            memcpy(buf, m->buf, min(len,m->length));
+            count = min(len,m->length);
+        }
+        free(m);
     }
-    free(b);
+    else{
+        buffer *b = stream_dequeue(shm_ptr, socket_cli.response_queue, len);
+        if(b->buf != NULL){
+            memcpy(buf, b->buf, b->length *sizeof(char));
+            count = b->length;
+            free(b->buf); 
+        }
+        free(b);
+    }
     if(pthread_mutex_unlock(socket_cli.response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
 
     return count;
@@ -202,7 +228,6 @@ ssize_t my_send(int sockfd, const void *buf, size_t len, int flags){
         if(close_arr[socket_cli.share_unit_index].server_read){
             if(need_timeout && my_stoptimer(true) == -1)
                 return -1; 
-
             return 0;
         }
         
@@ -213,7 +238,8 @@ ssize_t my_send(int sockfd, const void *buf, size_t len, int flags){
             socket_cli.is_socket_timeout = 0;
             errno = EWOULDBLOCK;
             return -1;
-        }        
+        }
+        usleep(0);        
     }
     
     if(socket_cli.send_timer != NULL && need_timeout){
@@ -223,8 +249,19 @@ ssize_t my_send(int sockfd, const void *buf, size_t len, int flags){
     }
     
     if(pthread_mutex_lock(socket_cli.request_lock) != 0) log_error("pthread_mutex_lock request_lock failed");
-    ssize_t count = 0;
-    count = stream_enqueue(shm_ptr, socket_cli.request_queue, (char *)buf, len);
+    ssize_t count = 0;  
+    if(socket_cli.type == SOCK_DGRAM){
+        message_t m = {
+            .length = len,
+        };
+        if(len > MESSAGE_MAX_LENGTH)
+            log_error("need to increase MESSAGE_MAX_LENGTH, len=%d", len);
+        memcpy(m.buf, buf, min(len,MESSAGE_MAX_LENGTH));
+        if(datagram_enqueue(shm_ptr, socket_cli.request_queue, m) == 0)
+            count = len;
+    }
+    else
+        count = stream_enqueue(shm_ptr, socket_cli.request_queue, (char *)buf, len);
     if(pthread_mutex_unlock(socket_cli.request_lock) != 0) log_error("pthread_mutex_unlock request_lock failed");
 
     return count;
@@ -248,6 +285,9 @@ int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         log_error("socket not in use");
         return -1;
     }
+
+    if(socket_cli.is_udp)
+        return 0;
 
     connection c = (connection){
         .client_fd = sockfd
@@ -309,8 +349,12 @@ int my_socket(int domain, int type, int protocol){
         .send_timer = NULL,
         .recv_timer = NULL,
         .is_socket_timeout = 0,
-        .poll_timer = NULL
+        .poll_timer = NULL,
+        .is_udp = false
     };
+
+    if(type == SOCK_DGRAM)
+        socket_cli.is_udp = true;
 
     // return original_socket(domain, type, protocol);
     return 999;
@@ -495,8 +539,23 @@ int my_poll(struct pollfd *fds, nfds_t nfds, int timeout){
 
 
 __attribute__((constructor)) void init(){
+    // log_set_quiet(true);
     // initialize share memory
-    shm_fd = shm_open("message_sm", O_CREAT | O_RDWR, 0666);
+    shm_name = NULL;
+    connect_shm_name = NULL;
+    close_shm_name = NULL;
+    control_sock_name = NULL;
+    shm_name = (char *)malloc(50*sizeof(char));
+    if(shm_name == NULL){
+      log_error("shm_name malloc failed");
+      exit(999);
+    }
+    if(TEST_SERVER)
+        snprintf(shm_name, 50, "message_sm_%llu", get_cur_time());
+    else
+        snprintf(shm_name, 50, "message_sm");
+    setenv("AFLNET_SHARE_MESSAGE_SHM", shm_name, 1);
+    shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
     if (shm_fd < 0){
         log_error("shm_open failed");
         exit(1);
@@ -509,7 +568,17 @@ __attribute__((constructor)) void init(){
     }
 
     // initialize connect share memory
-    connect_shm_fd = shm_open("connect_sm", O_CREAT | O_RDWR, 0666);
+    connect_shm_name = (char *)malloc(50*sizeof(char));
+    if(connect_shm_name == NULL){
+      log_error("connect_shm_name malloc failed");
+      exit(999);
+    }
+    if(TEST_SERVER)
+        snprintf(connect_shm_name, 50, "connect_sm_%llu", get_cur_time());
+    else
+        snprintf(connect_shm_name, 50, "connect_sm");
+    setenv("AFLNET_SHARE_CONNECT_SHM", connect_shm_name, 1);
+    connect_shm_fd = shm_open(connect_shm_name, O_CREAT | O_RDWR, 0666);
     if (connect_shm_fd < 0){
         log_error("shm_open failed");
         exit(1);
@@ -529,7 +598,17 @@ __attribute__((constructor)) void init(){
     memset(&socket_cli, 0, sizeof(mysocket));
 
     // initialize close share memory
-    close_shm_fd = shm_open("close_sm", O_CREAT | O_RDWR, 0666);
+    close_shm_name = (char *)malloc(50*sizeof(char));
+    if(close_shm_name == NULL){
+      log_error("close_shm_name malloc failed");
+      exit(999);
+    }
+    if(TEST_SERVER)
+        snprintf(close_shm_name, 50, "close_sm_%llu", get_cur_time());
+    else
+        snprintf(close_shm_name, 50, "close_sm");
+    setenv("AFLNET_SHARE_CLOSE_SHM", close_shm_name, 1);
+    close_shm_fd = shm_open(close_shm_name, O_CREAT | O_RDWR, 0666);
     if (close_shm_fd < 0){
         log_error("shm_open failed");
         exit(999);
@@ -544,6 +623,40 @@ __attribute__((constructor)) void init(){
 
     // set signal handler for recv and send timeout
     signal(SIGUSR2, my_signal_handler);
+
+    control_sock_name = (char *)malloc(50*sizeof(char));
+    if(control_sock_name == NULL){
+      log_error("control_sock_name malloc failed");
+      exit(999);
+    }
+    if(TEST_SERVER)
+        snprintf(control_sock_name, 50, "/tmp/control_sock_%llu", get_cur_time());
+    else
+        snprintf(control_sock_name, 50, "/tmp/control_sock");
+    setenv("CONTROL_SOCKET_NAME", control_sock_name, 1);
+}
+
+__attribute__((destructor)) void cleanup(void){
+    // unlink all the share memory
+    if(shm_name){
+      shm_unlink(shm_name);
+      free(shm_name);
+    }
+
+    if(connect_shm_name){
+      shm_unlink(connect_shm_name);
+      free(connect_shm_name);
+    }
+
+    if(close_shm_name){
+      shm_unlink(close_shm_name);
+      free(close_shm_name);
+    }
+
+    if(control_sock_name){
+      unlink(control_sock_name);
+      free(control_sock_name);
+    }
 }
 
 int main()  
@@ -553,7 +666,32 @@ int main()
     char buf[BUF_SIZE]; 
     memset(buf, 0, BUF_SIZE); 
     int n;  
-    sock = my_socket(AF_INET, SOCK_STREAM, 0);
+
+    int control_server = -1;
+    control_server = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if(control_server < 0) {
+        log_error("control socket create failed");
+    }
+
+    struct sockaddr_un serveraddr;
+    memset(&serveraddr, 0, sizeof(serveraddr));
+    serveraddr.sun_family = AF_UNIX;
+    strncpy(serveraddr.sun_path, control_sock_name, sizeof(serveraddr.sun_path)); 
+
+    if(unlink(control_sock_name) == -1)
+        log_error("first time or unlink control socket failed, %s", strerror(errno));
+
+    if(bind(control_server, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) == -1)
+        log_error("control socket bind failed, %s", strerror(errno));
+
+    if(listen(control_server, 1) < 0)
+        log_error("control socket listen failed, %s", strerror(errno));
+
+
+    if(USE_UDP)
+        sock = my_socket(AF_INET, SOCK_DGRAM, 0); 
+    else
+        sock = my_socket(AF_INET, SOCK_STREAM, 0);  
 
     server.sin_family = AF_INET;  
     server.sin_port = htons(12345);  
@@ -562,36 +700,75 @@ int main()
     struct timeval timeout;
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
-    my_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
-    my_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
+    //my_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+    //my_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
     if(my_connect(sock, (struct sockaddr *)&server, sizeof(server)) == -1){
         printf("my_connect failed\n");
         exit(1);
     }
 
+    printf("start accept\n");
+
+    int control_sock = accept(control_server, NULL, NULL);
+    if(control_sock == -1)
+        log_error("control socket accept failed");
+
+    char control_buf[CONTROL_BUF_LEN];
+    memset(control_buf, 0, CONTROL_BUF_LEN);
+
+    if(USE_UDP){
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 25000;
+        if(setsockopt(control_sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0)
+        log_error("control socket setsockopt failed");
+        // receive message from control socket
+        if((n = recv(control_sock, control_buf, CONTROL_BUF_LEN, MSG_NOSIGNAL)) < 0){
+            log_error("received share_unit_index failed, %s", strerror(errno));
+            exit(999);
+        }
+        log_trace("control message length: %d", n);
+        if(n > 0 && (memcmp(control_buf, "share_unit_index:", min(17,n)) == 0)){
+            int share_unix_index;
+            sscanf(control_buf, "share_unit_index:%d", &share_unix_index);
+            log_trace("share_unit_index: %d", share_unix_index);
+            socket_cli.share_unit_index = share_unix_index;
+            socket_cli.request_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_queue);
+            socket_cli.response_queue = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_queue);
+            socket_cli.request_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].request_lock);
+            socket_cli.response_lock = &(((share_unit *)shm_ptr)[socket_cli.share_unit_index].response_lock);
+        }
+    }
+    
+    char filename[100] = {0};
+    memset(filename, 0, 100);
     for(int i = 0; i < ROUND_TIME; i++){
         memset(buf, (i+1)%100, BUF_SIZE);
-        /*
-        FILE *file = fopen("test_query","rb");
-        if(fread(buf, 1, BUF_SIZE, file) <= 0){
+        
+        snprintf(filename, 100, "tinydtls/ecc_handshake_client_%d", i+1);
+        FILE *file = fopen(filename,"rb");
+        size_t file_size;
+        if((file_size = fread(buf, 1, BUF_SIZE, file)) <= 0){
             printf("read query failed\n");
             exit(-1);
         }
-        fclose(file);*/
-        if((n = my_send(sock, buf, BUF_SIZE, 0)) < 0){
+        fclose(file);
+        if((n = my_send(sock, buf, file_size, 0)) < 0){
             printf("send failed\n");
         } 
-        // printf("[Info] Send %d bytes\n", n);
+        printf("[Info] Send %d bytes\n", n);
 
+        if((n = recv(control_sock, control_buf, CONTROL_BUF_LEN, MSG_NOSIGNAL)) <= 0)
+            printf("control socket recv failed, %s", strerror(errno));
+        
         int recv_count = 0;
-        while(recv_count < BUF_SIZE){
+        //while(recv_count < BUF_SIZE){
             if((n = my_recv(sock, buf+recv_count, BUF_SIZE-recv_count, 0)) < 0){
                 printf("recv failed\n");
             }
-            recv_count += n;
-        }
-        // printf("[Info] Receive %d bytes\n", n);
-        // my_print_hex(buf, n);
+            //recv_count += n;
+        //}
+        printf("[Info] Receive %d bytes\n", n);
+        my_print_hex(buf, n);
 
         // sleep(0.01);
     }

@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <time.h>
+#include <stdbool.h>
 #include "share_queue.h"
 typedef struct mysocket mysocket;
 #define LO_MSS 65496
@@ -48,6 +49,8 @@ struct mysocket {
     timer_t recv_timer;
     timer_t poll_timer;
     int is_socket_timeout;
+    // for udp
+    bool is_udp;
 };
 
 #endif

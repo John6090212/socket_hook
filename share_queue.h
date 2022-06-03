@@ -3,7 +3,7 @@
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 #define max(a,b) (((a) > (b)) ? (a) : (b))
-#define MESSAGE_MAX_LENGTH 1500
+#define MESSAGE_MAX_LENGTH 65536
 
 typedef struct share_queue share_queue;
 typedef struct buffer buffer;

@@ -5,13 +5,13 @@
 #include "share_queue.h"
 #include "queue.h"
 
-#define STREAM_QUEUE_CAPACITY 30080
-#define DATAGRAM_QUEUE_CAPACITY 20
+#define DATAGRAM_QUEUE_CAPACITY 5
+#define STREAM_QUEUE_CAPACITY DATAGRAM_QUEUE_CAPACITY*sizeof(message_t)
 #define CONNECT_QUEUE_CAPACITY 20
 #define ACCEPT_QUEUE_CAPACITY 10
 #define INT_QUEUE_CAPACITY 7520
 // share memory size for share unit
-#define COMMUNICATE_SHM_SIZE 0x400000
+#define COMMUNICATE_SHM_SIZE (sizeof(share_unit)*SOCKET_NUM)
 // share memory size for connect and accept 
 #define CONNECT_SHM_SIZE 0x5000
 // share memory size for close
@@ -20,6 +20,7 @@
 #define SOCKET_NUM 5
 
 // share memory for socket communication 
+char *shm_name;
 int shm_fd;
 void *shm_ptr;
 
@@ -34,6 +35,7 @@ struct share_unit {
 };
 
 // share memory for socket connection
+char *connect_shm_name;
 int connect_shm_fd;
 void *connect_shm_ptr;
 connect_queue *connect_queue_ptr;
@@ -50,6 +52,7 @@ struct close_unit {
 };
 
 // share memory for socket close
+char *close_shm_name;
 int close_shm_fd;
 void *close_shm_ptr;
 close_unit *close_arr;
