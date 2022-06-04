@@ -5,7 +5,7 @@
 #include "share_queue.h"
 #include "queue.h"
 
-#define DATAGRAM_QUEUE_CAPACITY 5
+#define DATAGRAM_QUEUE_CAPACITY 50
 #define STREAM_QUEUE_CAPACITY DATAGRAM_QUEUE_CAPACITY*sizeof(message_t)
 #define CONNECT_QUEUE_CAPACITY 20
 #define ACCEPT_QUEUE_CAPACITY 10

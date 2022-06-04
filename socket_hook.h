@@ -140,5 +140,6 @@ unsigned long select_check_num[64];
 
 // for tinydtls
 int tinydtls_fd;
+struct sockaddr_in6 tinydtls_peer_addr;
 
 #endif

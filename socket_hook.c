@@ -190,17 +190,17 @@ int init_socket(int fd, int domain, int type, int protocol){
         log_fatal("need to increase SOCK_NUM");
         return -1;
     }
-    if(type == SOCK_DGRAM)
+    if(type == SOCK_DGRAM){
         init_share_queue(socket_arr[fd].share_unit_index, false);
+        socket_arr[fd].is_udp = true;
+    }
     else
         init_share_queue(socket_arr[fd].share_unit_index, true);
+
     socket_arr[fd].request_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_queue);
     socket_arr[fd].response_queue = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_queue);
     socket_arr[fd].request_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].request_lock);
     socket_arr[fd].response_lock = &(((share_unit *)shm_ptr)[socket_arr[fd].share_unit_index].response_lock);
-    
-    if(type == SOCK_DGRAM)
-        socket_arr[fd].is_udp = true;
 
     return 0;
 }
@@ -439,8 +439,14 @@ int socket(int domain, int type, int protocol){
         log_info("socket time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     }
 
-    if(server == TINYDTLS)
+    if(server == TINYDTLS){
         tinydtls_fd = fd;
+        memset(&tinydtls_peer_addr, 0, sizeof(struct sockaddr_in6));
+        tinydtls_peer_addr.sin6_family = AF_INET6;
+        tinydtls_peer_addr.sin6_port = htons(8888);
+        const unsigned char localhost_bytes[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        memcpy(&tinydtls_peer_addr.sin6_addr, localhost_bytes, sizeof(localhost_bytes));
+    }
 
     return fd;
 }
@@ -758,7 +764,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
             message_t *m = datagram_dequeue(shm_ptr, socket_arr[sockfd].request_queue);
             if(m->length != 0){
                 memcpy(buf, m->buf, min(len,m->length));
-                count = m->length;
+                count = (flags & MSG_TRUNC) ? m->length : min(len,m->length);
             }
             free(m);
         }
@@ -1274,6 +1280,13 @@ ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, st
         if(!(flags & MSG_WAITALL) || (socket_arr[socket].type == SOCK_DGRAM)) break;
     }
 
+    if(server == TINYDTLS){
+        if(address != NULL)
+            memcpy(address, &tinydtls_peer_addr, sizeof(tinydtls_peer_addr));
+        if(address_len != NULL)
+            *address_len = sizeof(tinydtls_peer_addr);
+    }
+
     return count;
 }
 
@@ -1304,7 +1317,7 @@ ssize_t sendto(int socket, const void *message, size_t length, int flags, const 
             log_error("need to increase MESSAGE_MAX_LENGTH, len=%d", length);
         memcpy(m.buf, message, min(length,MESSAGE_MAX_LENGTH));
         if(datagram_enqueue(shm_ptr, socket_arr[socket].response_queue, m) == 0)
-            count = length;
+            count = min(length,MESSAGE_MAX_LENGTH);
     }
     else{
         log_fatal("not implement socket type in sendto!");
@@ -1801,12 +1814,22 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
     // send message to control
     if(server == TINYDTLS && read_count == 1 && tinydtls_fd >= 0){
+        // remove message from request queue to avoid request queue being exhausted
+        if(socket_arr[tinydtls_fd].request_queue->current_size > 0){
+            message_t *m = datagram_dequeue(shm_ptr, socket_arr[tinydtls_fd].request_queue);
+            free(m);
+        }
         log_trace("send malformed to control server");
         // send message through control socket
         const char control_buf[] = "malformed";
-        ssize_t n;
-        if((n = original_send(socket_arr[tinydtls_fd].control_sock, control_buf, sizeof(control_buf), MSG_NOSIGNAL)) <= 0){
-            log_error("control socket send malformed failed, n=%d", n);
+        ssize_t n = 0;
+        while(n < sizeof(control_buf)){
+            if((n = original_send(socket_arr[tinydtls_fd].control_sock, control_buf, sizeof(control_buf), MSG_NOSIGNAL)) <= 0){
+                if(errno == EINTR)
+                    continue;
+                log_error("control socket send malformed failed, n=%d, %s", n, strerror(errno));
+                break;
+            }
         }
         read_count = 0;
     }
@@ -1887,6 +1910,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
                 update_fd_set(hook_nfds, hook_nfds_len, readfds, writefds, exceptfds, read_hook_fd, write_hook_fd, except_hook_fd);
 
+                if(hook_nfds != NULL)
+                    free(hook_nfds);
+
                 if(PROFILING_TIME){
                     clock_gettime(CLOCK_REALTIME, &finish);
                     sub_timespec(start, finish, &delta);
@@ -1938,6 +1964,10 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
                     else
                         log_info("select (hook- n+) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
                 }
+
+                if(hook_nfds != NULL)
+                    free(hook_nfds);
+
                 return hook_result+result;
             }
             usleep(0);
@@ -1950,6 +1980,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
             hook_result = hook_fd_select(hook_nfds, hook_nfds_len, hook_bit_count, read_hook_fd, write_hook_fd, except_hook_fd);
             usleep(0);
         }
+
+        if(hook_nfds != NULL)
+            free(hook_nfds);
 
         if(PROFILING_TIME){
             clock_gettime(CLOCK_REALTIME, &finish);
@@ -1980,6 +2013,10 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
                 sub_timespec(start, finish, &delta);
                 log_info("only hook fd select timeout time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
             }
+
+            if(hook_nfds != NULL)
+                free(hook_nfds);
+
             return 0;
         }
         usleep(0);
@@ -1990,6 +2027,9 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
     if(hook_result > 0)
         update_fd_set(hook_nfds, hook_nfds_len, readfds, writefds, exceptfds, read_hook_fd, write_hook_fd, except_hook_fd);
+
+    if(hook_nfds != NULL)
+        free(hook_nfds);
 
     if(PROFILING_TIME){
         clock_gettime(CLOCK_REALTIME, &finish);
