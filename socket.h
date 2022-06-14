@@ -51,6 +51,8 @@ struct mysocket {
     int is_socket_timeout;
     // for udp
     bool is_udp;
+    // for SO_ERROR
+    bool has_error;
 };
 
 #endif

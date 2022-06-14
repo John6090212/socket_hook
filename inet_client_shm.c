@@ -26,10 +26,10 @@
 #include "queue.h"
 #include "log.h"
   
-#define BUF_SIZE 200
-#define ROUND_TIME 7
+#define BUF_SIZE 300
+#define ROUND_TIME 3
 #define CONTROL_BUF_LEN 25
-#define USE_UDP 1
+#define USE_UDP 0
 #define TEST_SERVER 0
 
 // print char array in hex
@@ -293,14 +293,18 @@ int my_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         .client_fd = sockfd
     };
     memcpy(&c.addr, addr, sizeof(struct sockaddr));
-
-    while(connect_queue_ptr->size == connect_queue_ptr->capacity);
+    log_trace("before my_connect while loop");
+    while(connect_queue_ptr->size == connect_queue_ptr->capacity)
+        usleep(0);
+    log_trace("after my_connect while_loop");
     if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
     if(Connect_enqueue(connect_shm_ptr, connect_queue_ptr, c) == -1)
         log_error("connect queue enqueue failed");
     if(pthread_mutex_unlock(connect_lock) != 0) log_error("pthread_mutex_unlock connect_lock failed");
-    
-    while(accept_queue_ptr->size == 0);
+    log_trace("before accept_queue while loop");
+    while(accept_queue_ptr->size == 0)
+        usleep(0);
+    log_trace("after accept_queue while loop");        
     if(pthread_mutex_lock(accept_lock) != 0) log_error("pthread_mutex_lock accept_lock failed");
     acception *a = Accept_dequeue(connect_shm_ptr, accept_queue_ptr);
     if(pthread_mutex_unlock(accept_lock) != 0) log_error("pthread_mutex_unlock accept_lock failed");
@@ -694,7 +698,7 @@ int main()
         sock = my_socket(AF_INET, SOCK_STREAM, 0);  
 
     server.sin_family = AF_INET;  
-    server.sin_port = htons(12345);  
+    server.sin_port = htons(5158);  
 
     inet_pton(AF_INET, "127.0.0.1", &server.sin_addr.s_addr);  
     struct timeval timeout;
@@ -744,14 +748,19 @@ int main()
     for(int i = 0; i < ROUND_TIME; i++){
         memset(buf, (i+1)%100, BUF_SIZE);
         
-        snprintf(filename, 100, "tinydtls/ecc_handshake_client_%d", i+1);
+        snprintf(filename, 100, "dcmqrscp/dicom_echo_%d", i+1);
         FILE *file = fopen(filename,"rb");
+        if(file == NULL){
+            perror("fopen failed");
+            exit(-1);
+        }
         size_t file_size;
         if((file_size = fread(buf, 1, BUF_SIZE, file)) <= 0){
             printf("read query failed\n");
             exit(-1);
         }
         fclose(file);
+        printf("start my_send\n");
         if((n = my_send(sock, buf, file_size, 0)) < 0){
             printf("send failed\n");
         } 

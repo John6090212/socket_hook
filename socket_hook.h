@@ -54,10 +54,9 @@
 // for logging
 #include "log.h"
 
-#define USE_DNSMASQ_POLL 1
 #define PROFILING_TIME 1
 
-enum SERVER_TYPE {DNSMASQ, TINYDTLS, OTHER} server;
+enum SERVER_TYPE {DNSMASQ, TINYDTLS, DCMQRSCP, OTHER} server;
 
 // origin function pointer
 int (*original_socket)(int, int, int);
@@ -101,6 +100,7 @@ timer_t poll_timer;
 struct timespec hook_start_time;
 // for control socket
 int read_count;
+int write_count;
 // for smart affinity
 int aflnet_cpu_id;
 int next_cpu_id;
@@ -116,11 +116,15 @@ void my_log_hex(char *m, int length);
 // just compare family and port
 int cmp_addr(const struct sockaddr *a, const struct sockaddr *b);
 
+// for send and recv timeout
+int my_settimer(int fd, int is_send);
+int my_stoptimer(int fd, int is_send);
+
 // poll timer
 void my_signal_handler(int signum);
 int my_createtimer(timer_t *timer);
 int my_poll_settimer(int timeout);
-int my_poll_stoptimer(void);
+int my_poll_stoptimer(timer_t timer);
 
 // initialize function
 void init_share_queue(int i, bool is_stream);
@@ -141,5 +145,12 @@ unsigned long select_check_num[64];
 // for tinydtls
 int tinydtls_fd;
 struct sockaddr_in6 tinydtls_peer_addr;
+
+// for parallel fuzzing
+bool USE_SMART_AFFINITY;
+
+// for server use fork such as dcmqrscp
+pid_t fork_pid;
+int dcmqrscp_fd;
 
 #endif
