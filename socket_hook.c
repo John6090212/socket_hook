@@ -312,6 +312,7 @@ void init_function_pointer(void){
     original_poll = dlsym(RTLD_NEXT, "poll");
     original_fork = dlsym(RTLD_NEXT, "fork");
     original_select = dlsym(RTLD_NEXT, "select");
+    original_fopen = dlsym(RTLD_NEXT, "fopen");
 }
 
 void init_logging(void){
@@ -457,6 +458,11 @@ __attribute__((constructor)) void init(){
 
     // for server use fork such as dcmqrscp
     fork_pid = -2;
+
+    // use to resolve resource collision in parallel fuzzing
+    parallel_id = getenv("PARALLEL_ID");
+    if(parallel_id == NULL)
+        log_error("not using parallel or PARALLEL_ID getenv failed");
 }
 
 /*
@@ -2333,4 +2339,24 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
         log_info("only hook fd select time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     }
     return hook_result;
+}
+
+FILE *fopen(const char * pathname, const char * mode){
+    log_trace("hook fopen, pathname = %s", pathname);
+    if(server != DCMQRSCP || strncmp(pathname, "./dcmqrscp.cfg", 14) != 0){
+        log_trace("use original fopen");
+        return original_fopen(pathname, mode);
+    }
+
+    // need to modify config name for dcmqrscp
+    log_trace("detect open ./dcmqrscp.cfg");
+    char new_pathname[20];
+    if(parallel_id != NULL){
+        snprintf(new_pathname, 20, "./dcmqrscp_%s.cfg", parallel_id);
+        log_trace("new_pathname: %s", new_pathname);
+    }
+    else
+        strncpy(new_pathname, "./dcmqrscp.cfg", 20);
+
+    return original_fopen(new_pathname, mode);
 }

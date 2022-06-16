@@ -85,6 +85,7 @@ ssize_t (*original_sendmsg)(int socket, const struct msghdr *message, int flags)
 int (*original_poll)(struct pollfd *fds, nfds_t nfds, int timeout);
 pid_t (*original_fork)(void);
 int (*original_select)(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+FILE *(*original_fopen)(const char * pathname, const char * mode);
 
 // queue to acquire available fd
 Stack *available_fd;
@@ -149,8 +150,9 @@ struct sockaddr_in6 tinydtls_peer_addr;
 // for parallel fuzzing
 bool USE_SMART_AFFINITY;
 
-// for server use fork such as dcmqrscp
+// for dcmqrscp
 pid_t fork_pid;
 int dcmqrscp_fd;
+char *parallel_id;
 
 #endif
