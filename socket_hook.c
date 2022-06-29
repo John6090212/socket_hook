@@ -321,8 +321,12 @@ void init_logging(void){
     time_t cur_t = time(0);
     struct tm* t = localtime(&cur_t);
     char log_name[100] = {0};
-    snprintf(log_name, 100, "socket_hook_%04u-%02u-%02u-%02u:%02u:%02u.log", 
-      t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+    if (parallel_id != NULL)
+      snprintf(log_name, 100, "socket_hook_%04u-%02u-%02u-%02u:%02u:%02u_%s.log",
+        t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec, parallel_id);
+    else
+      snprintf(log_name, 100, "socket_hook_%04u-%02u-%02u-%02u:%02u:%02u.log", 
+        t->tm_year + 1900, t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
     FILE *fp = fopen((const char *)log_name, "w+");
     if(fp && fileno(fp) != -1){
         log_fd = fileno(fp);
@@ -406,6 +410,15 @@ __attribute__((constructor)) void init(){
     
     init_function_pointer();
 
+    // use to resolve resource collision in parallel fuzzing
+    if(USE_PARALLEL){
+        parallel_id = getenv("PARALLEL_ID");
+        if(parallel_id == NULL)
+            log_error("not using parallel or PARALLEL_ID getenv failed");
+    }
+    else
+        parallel_id = NULL;
+
     init_logging();
 
     init_share_memory();
@@ -459,10 +472,6 @@ __attribute__((constructor)) void init(){
     // for server use fork such as dcmqrscp
     fork_pid = -2;
 
-    // use to resolve resource collision in parallel fuzzing
-    parallel_id = getenv("PARALLEL_ID");
-    if(parallel_id == NULL)
-        log_error("not using parallel or PARALLEL_ID getenv failed");
 }
 
 /*
@@ -2343,7 +2352,7 @@ int select(int nfds, fd_set *readfds, fd_set *writefds,
 
 FILE *fopen(const char * pathname, const char * mode){
     log_trace("hook fopen, pathname = %s", pathname);
-    if(server != DCMQRSCP || strncmp(pathname, "./dcmqrscp.cfg", 14) != 0){
+    if(!(USE_PARALLEL) || server != DCMQRSCP || strncmp(pathname, "./dcmqrscp.cfg", 14) != 0){
         log_trace("use original fopen");
         return original_fopen(pathname, mode);
     }
@@ -2354,9 +2363,8 @@ FILE *fopen(const char * pathname, const char * mode){
     if(parallel_id != NULL){
         snprintf(new_pathname, 20, "./dcmqrscp_%s.cfg", parallel_id);
         log_trace("new_pathname: %s", new_pathname);
+        return original_fopen(new_pathname, mode);
     }
     else
-        strncpy(new_pathname, "./dcmqrscp.cfg", 20);
-
-    return original_fopen(new_pathname, mode);
+        return original_fopen(pathname, mode);
 }

@@ -154,5 +154,6 @@ bool USE_SMART_AFFINITY;
 pid_t fork_pid;
 int dcmqrscp_fd;
 char *parallel_id;
+#define USE_PARALLEL 0
 
 #endif
