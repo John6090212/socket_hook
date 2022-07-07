@@ -11,11 +11,12 @@
 #include <poll.h>
 #include <stdlib.h>
 #include <time.h>
+#include <sys/select.h>
 
 // #include "poll.h"
 
 #define BUF_SIZE 100
-#define ROUND_TIME 2
+#define ROUND_TIME 10
 
 // print char array in hex
 void my_print_hex(char *m, int length){
@@ -45,15 +46,15 @@ int main()
     listen(sock0, 5);  
     //printf("[Info] listening...\n");
 
-    struct sockaddr_in addrtest;
-    socklen_t lentest = sizeof(addrtest);
+    //struct sockaddr_in addrtest;
+    //socklen_t lentest = sizeof(addrtest);
     // getsockname(sock0, (struct sockaddr *)&addrtest, &lentest);
     // printf("socket name: %s, socket port: %d\n", inet_ntoa(addrtest.sin_addr), addrtest.sin_port);
     //printf("[Info] wait for connection...\n");  
     len = sizeof(client); 
-    int flags;
-    // if ((flags = fcntl(sock0, F_GETFL)) == -1 || fcntl(sock0, F_SETFL, flags | O_NONBLOCK) == -1)
-        // printf("set non-blocking failed\n");
+    //int flags;
+    //if ((flags = fcntl(sock0, F_GETFL)) == -1 || fcntl(sock0, F_SETFL, flags | O_NONBLOCK) == -1)
+        //printf("set non-blocking failed\n");
 
     /*
     int sock1;  
@@ -81,12 +82,19 @@ int main()
         sock_client = accept(sock0, (struct sockaddr *)&client, &len); 
     }
     */
+    printf("start accept\n");
     sock_client = accept(sock0, (struct sockaddr *)&client, &len); 
     // getpeername(sock_client, (struct sockaddr *)&addrtest, &lentest);
     // printf("socket name: %s, socket port: %d\n", inet_ntoa(addrtest.sin_addr), addrtest.sin_port);
+    /*
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
 
+    FD_SET(sock_client, &rfds);
+    */
     struct timeval tv;
-    tv.tv_sec = 1;
+    tv.tv_sec = 5;
     tv.tv_usec = 0;
     // setsockopt(sock_client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     char buf[BUF_SIZE];
@@ -94,31 +102,53 @@ int main()
     int msg_count = 0;
     int n = 0;
 
+    printf("start for loop\n");
     for(int i = 0; i < ROUND_TIME; i++){
         // printf("i = %d\n", i);
         int recv_count = 0;
-        // while(recv_count < BUF_SIZE){
+        /*
+        int result = select(sock_client+1, &rfds, &wfds, NULL, &tv);
+        printf("result = %d\n", result);
+        if(FD_ISSET(sock_client, &rfds))
+            printf("sock_client read is set\n");
+        */
+        //while(recv_count < BUF_SIZE){
             if((n = read(sock_client,buf+recv_count,BUF_SIZE-recv_count)) < 0){
                 perror("recv failed");
                 break;
             }
-            // recv_count += n;
-        // }
-        
+            //recv_count += n;
+        //}
+
         msg_count++;
         // printf("[Info] Received %d message\n", msg_count);
         printf("[Info] Received %d bytes\n", n);
-        my_print_hex(buf, n);
-
-        memset(buf, (i+11)%100, BUF_SIZE);
+        //my_print_hex(buf, n);
+        
+        // memset(buf, (i+11)%100, BUF_SIZE);
+        
         if ((n = write(sock_client,buf,BUF_SIZE)) < 0){
             printf("server send failed\n");
         }
-
+        
         printf("[Info] Send %d bytes\n", n);
-    }
-    //printf("[Info] Close client connection...\n");  
 
+        if(i == 0){
+            pid_t pid;
+            if((pid = fork()) < 0)
+                perror("fork failed");
+            else if(pid == 0){
+                printf("child break\n");
+                break;
+            }
+            else{
+                printf("parent sleep\n");
+                sleep(1);
+            }
+        }
+    }
+
+    //printf("[Info] Close client connection...\n");  
 
     close(sock_client);  
 

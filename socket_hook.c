@@ -406,7 +406,7 @@ __attribute__((constructor)) void init(){
         clock_gettime(CLOCK_REALTIME, &hook_start_time);
 
     // initialize server type
-    server = DCMQRSCP;
+    server = DNSMASQ;
     
     init_function_pointer();
 
@@ -746,7 +746,7 @@ int close(int fd){
     if(PROFILING_TIME)
         clock_gettime(CLOCK_REALTIME, &start);
 
-    if(fork_pid != getpid()){
+    if(server == DCMQRSCP && fork_pid != getpid()){
         if(socket_arr[fd].share_unit_index >= 0){
             close_arr[socket_arr[fd].share_unit_index].server_read = 1;
             close_arr[socket_arr[fd].share_unit_index].server_write = 1;
@@ -1874,34 +1874,52 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
 pid_t fork(void){
     log_trace("hook fork!, pid=%d", getpid());
 
-    pid_t pid = original_fork();
-    if(pid == -1)
-        return pid;
-    else if(pid == 0){
+    if(server == DNSMASQ){
         // change cpu affinity
-        if(USE_SMART_AFFINITY){
-            cpu_set_t c;
-            CPU_ZERO(&c);
-            CPU_SET(next_cpu_id, &c);
-            if (sched_setaffinity(0, sizeof(c), &c))
-                log_error("sched_setaffinity failed");
-            log_trace("pin process to cpu %d", next_cpu_id);
+        cpu_set_t c;
+        CPU_ZERO(&c);
+        CPU_SET(next_cpu_id, &c);
+        if (sched_setaffinity(0, sizeof(c), &c))
+            log_error("sched_setaffinity failed");
+        log_trace("pin process to cpu %d", next_cpu_id);
 
-            //Update next_cpu_id
+        //Update next_cpu_id
+        next_cpu_id = (next_cpu_id + 1) % cpu_count;
+        if(next_cpu_id == aflnet_cpu_id)
             next_cpu_id = (next_cpu_id + 1) % cpu_count;
-            if(next_cpu_id == aflnet_cpu_id)
-                next_cpu_id = (next_cpu_id + 1) % cpu_count;
-        }
-        fork_pid = getpid();
-        // reset read_count for dcmqrscp
-        if(server == DCMQRSCP){
-            read_count = 0;
-            write_count = 0;
-        }
-        return pid;
+
+        return original_fork();
     }
-    else
-        return pid;
+    else{
+        pid_t pid = original_fork();
+        if(pid == -1)
+            return pid;
+        else if(pid == 0){
+            // change cpu affinity
+            if(USE_SMART_AFFINITY){
+                cpu_set_t c;
+                CPU_ZERO(&c);
+                CPU_SET(next_cpu_id, &c);
+                if (sched_setaffinity(0, sizeof(c), &c))
+                    log_error("sched_setaffinity failed");
+                log_trace("pin process to cpu %d", next_cpu_id);
+
+                //Update next_cpu_id
+                next_cpu_id = (next_cpu_id + 1) % cpu_count;
+                if(next_cpu_id == aflnet_cpu_id)
+                    next_cpu_id = (next_cpu_id + 1) % cpu_count;
+            }
+            fork_pid = getpid();
+            // reset read_count for dcmqrscp
+            if(server == DCMQRSCP){
+                read_count = 0;
+                write_count = 0;
+            }
+            return pid;
+        }
+        else
+            return pid;
+    }
 }
 
 int get_select_nfds(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, int *normal_nfds, int **hook_nfds, int *hook_nfds_len, bool *read_hook_fd, bool *write_hook_fd, bool *except_hook_fd){
@@ -2115,6 +2133,8 @@ int my_select_stoptimer(void){
 
 int select(int nfds, fd_set *readfds, fd_set *writefds, 
         fd_set *exceptfds, struct timeval *timeout){
+    if(server == DNSMASQ)
+        return original_select(nfds, readfds, writefds, exceptfds, timeout);
 
     struct timespec start, finish, delta;
     if(PROFILING_TIME)
