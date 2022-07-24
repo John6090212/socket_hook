@@ -404,9 +404,6 @@ void init_share_memory(void){
 __attribute__((constructor)) void init(){
     if(PROFILING_TIME)
         clock_gettime(CLOCK_REALTIME, &hook_start_time);
-
-    // initialize server type
-    server = DNSMASQ;
     
     init_function_pointer();
 
@@ -420,6 +417,21 @@ __attribute__((constructor)) void init(){
         parallel_id = NULL;
 
     init_logging();
+
+    // initialize server type
+    char *server_type = getenv("SERVER");
+    if(server_type == NULL){
+      log_error("SERVER getenv failed");
+      exit(999);
+    }
+    if(!strncmp(server_type, "DNSMASQ", 7))
+      server = DNSMASQ;
+    else if(!strncmp(server_type, "TINYDTLS", 8))
+      server = TINYDTLS;
+    else if(!strncmp(server_type, "DCMQRSCP", 8))
+      server = DCMQRSCP;
+    else 
+      server = OTHER;
 
     init_share_memory();
 
@@ -569,7 +581,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         strncpy(serveraddr.sun_path, control_sock_name, sizeof(serveraddr.sun_path));
         
         int i;
-        for(i = 0; i < 10000; i++){
+        for(i = 0; i < 1000; i++){
             if(original_connect(socket_arr[sockfd].control_sock, (struct sockaddr *)&serveraddr, sizeof(serveraddr)) == 0) 
                 break;
             usleep(10);
