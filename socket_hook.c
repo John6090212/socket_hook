@@ -588,6 +588,8 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
         }
         if(i == 1000){
             log_error("control socket connect failed, %s", strerror(errno));
+            if(server == DCMQRSCP)
+                exit(0);
             return -1;
         }
 
@@ -640,15 +642,21 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
         errno = EMFILE;
         return -1;
     }
-    if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1)
-        return -1;
+    if(init_socket(fd, socket_arr[sockfd].domain, socket_arr[sockfd].type, socket_arr[sockfd].protocol) == -1){
+        push(available_fd, fd);
+        return -1; 
+    }
     socket_arr[fd].is_server = 1;
 
     // save bind address to share memory
     if(socket_arr[sockfd].has_bind == 1 && socket_arr[fd].share_unit_index >= 0 && socket_arr[fd].share_unit_index < SOCKET_NUM){
         while(connect_queue_ptr->size == 0)
             usleep(0);
-        if(pthread_mutex_lock(connect_lock) != 0) log_error("pthread_mutex_lock connect_lock failed");
+        if(pthread_mutex_lock(connect_lock) != 0){
+            log_error("pthread_mutex_lock connect_lock failed");
+            push(available_fd, fd);
+            return -1;
+        }
         connection *c = Connect_dequeue(connect_shm_ptr, connect_queue_ptr);
         if(pthread_mutex_unlock(connect_lock) != 0) log_error("pthread_mutex_unlock connect_lock failed");
         if(c != NULL){
@@ -766,7 +774,7 @@ int close(int fd){
     }
     push(available_share_unit, socket_arr[fd].share_unit_index);
     // clear address in connect sockaddr array
-    init_connect_accept_queue();
+    //init_connect_accept_queue();
     // close control socket
     if(socket_arr[fd].control_sock != -1)
         original_close(socket_arr[fd].control_sock);
@@ -792,6 +800,7 @@ int close(int fd){
     push(available_fd, fd);
 
     read_count = 0;
+    write_count = 0;
 
     if(PROFILING_TIME){
         clock_gettime(CLOCK_REALTIME, &finish);
@@ -1215,9 +1224,10 @@ ssize_t read(int fd, void *buf, size_t count){
     }
     else if(server == DCMQRSCP){
         read_count++;
+        log_trace("read_count in read = %d", read_count);
         write_count = 0;
         if(read_count >= 3){
-            log_trace("send malformed to control server");
+            log_error("send malformed to control server");
             // send message through control socket
             const char control_buf[] = "malformed";
             ssize_t n;
@@ -1324,8 +1334,10 @@ ssize_t write(int fd, const void *buf, size_t count){
     if(server == DNSMASQ || server == DCMQRSCP)
         read_count = 0; 
 
-    if(server == DCMQRSCP)
+    if(server == DCMQRSCP){
         write_count++;
+        log_trace("write_count in write = %d", write_count);
+    }
 
     if(PROFILING_TIME){
         clock_gettime(CLOCK_REALTIME, &finish);  
@@ -1676,6 +1688,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     log_trace("hook poll(), nfds=%ld, timeout=%d, pid=%d", nfds, timeout, getpid());
     int rv = 0, hook_rv = 0;
     
+    log_trace("read_count in poll = %d", read_count);
     if(server == DCMQRSCP && read_count >= 1 && dcmqrscp_fd >= 0){
         log_trace("send malformed to control server");
         // send message through control socket
@@ -1692,7 +1705,9 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
             }
         }
         read_count = 0;
+        
     }
+    write_count = 0;
     
     // save nfds for hook fd in poll
     nfds_t hook_nfds = get_poll_hook_nfds(fds, nfds);
