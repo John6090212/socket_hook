@@ -1,5 +1,18 @@
 #include "socket_hook.h"
 
+/* Get unix time in microseconds */
+
+static unsigned long long get_cur_time_us(void) {
+
+  struct timeval tv;
+  struct timezone tz;
+
+  gettimeofday(&tv, &tz);
+
+  return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
+
+}
+
 void sub_timespec(struct timespec t1, struct timespec t2, struct timespec *td)
 {
     td->tv_nsec = t2.tv_nsec - t1.tv_nsec;
@@ -253,7 +266,7 @@ int init_socket(int fd, int domain, int type, int protocol){
     };
     socket_arr[fd].share_unit_index = pop(available_share_unit);
     if(socket_arr[fd].share_unit_index == INT_MIN){
-        log_fatal("need to increase SOCK_NUM");
+        log_error("need to increase SOCK_NUM");
         return -1;
     }
     if(type == SOCK_DGRAM){
@@ -330,7 +343,7 @@ void init_logging(void){
     FILE *fp = fopen((const char *)log_name, "w+");
     if(fp && fileno(fp) != -1){
         log_fd = fileno(fp);
-        log_add_fp(fp, LOG_ERROR);
+        log_add_fp(fp, LOG_FATAL);
     }
 }
 
@@ -622,6 +635,9 @@ int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrl
     if(!is_valid_fd(sockfd))
         return original_accept(sockfd, addr, addrlen);
     
+    if(SPEEDUP_PROFILING)
+        log_fatal("start new round: %llu", get_cur_time_us());
+
     struct timespec start, finish, delta;
     int fd = 0;    
     if(PROFILING_TIME)
@@ -946,7 +962,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags){
             free(m);
         }
         else{
-            log_fatal("not implement socket type in recv!");
+            log_error("not implement socket type in recv!");
             exit(999);
         }
         if(pthread_mutex_unlock(socket_arr[sockfd].request_lock) != 0) log_error("pthread_mutex_unlock request lock failed");
@@ -1143,7 +1159,7 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags){
             count = len;
     }
     else{
-        log_fatal("not implement socket type in send!");
+        log_error("not implement socket type in send!");
         exit(999);
     }
     if(pthread_mutex_unlock(socket_arr[sockfd].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
@@ -1198,6 +1214,9 @@ ssize_t read(int fd, void *buf, size_t count){
     if(!is_valid_fd(fd))
         return original_read(fd, buf, count);
 
+    if(SPEEDUP_PROFILING)
+        log_fatal("read start: %llu", get_cur_time_us());
+
     struct timespec start, finish, delta;
     if(PROFILING_TIME)
         clock_gettime(CLOCK_REALTIME, &start);
@@ -1245,6 +1264,8 @@ ssize_t read(int fd, void *buf, size_t count){
             errno = EWOULDBLOCK;
             log_trace("read EWOULDBLOCK");
             socket_arr[fd].has_error = true;
+            if(SPEEDUP_PROFILING)
+                log_fatal("read EWOULDBLOCK: %llu", get_cur_time_us());
             return -1;
         }
     }
@@ -1256,6 +1277,8 @@ ssize_t read(int fd, void *buf, size_t count){
                 sub_timespec(start, finish, &delta);
                 log_info("read (client close) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
             }
+            if(SPEEDUP_PROFILING)
+                log_fatal("read timeout: %llu", get_cur_time_us());
             return 0;
         }
         usleep(0);
@@ -1278,6 +1301,8 @@ ssize_t read(int fd, void *buf, size_t count){
         sub_timespec(start, finish, &delta);
         log_info("read (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     }
+    if(SPEEDUP_PROFILING)
+        log_fatal("read end: %llu", get_cur_time_us());
     return my_count;
 }
 
@@ -1286,6 +1311,9 @@ ssize_t write(int fd, const void *buf, size_t count){
     if(!is_valid_fd(fd))
         return original_write(fd, buf, count);
     
+    if(SPEEDUP_PROFILING)
+        log_fatal("write start: %llu", get_cur_time_us());
+
     struct timespec start, finish, delta;
     if(PROFILING_TIME)
         clock_gettime(CLOCK_REALTIME, &start);
@@ -1300,6 +1328,8 @@ ssize_t write(int fd, const void *buf, size_t count){
         if(socket_arr[fd].response_queue->current_size == socket_arr[fd].response_queue->capacity){
             errno = EWOULDBLOCK;
             socket_arr[fd].has_error = true;
+            if(SPEEDUP_PROFILING)
+                log_fatal("write EWOULDBLOCK: %llu", get_cur_time_us());
             return -1;
         }
     }
@@ -1326,9 +1356,15 @@ ssize_t write(int fd, const void *buf, size_t count){
         log_trace("send after_write to control server");
         const char control_buf[] = "after_write";
         ssize_t n;
+        if(SPEEDUP_PROFILING)
+            log_fatal("control socket send start: %llu", get_cur_time_us());
         if((n = original_send(socket_arr[fd].control_sock, control_buf, sizeof(control_buf), MSG_NOSIGNAL)) <= 0){
+            if(SPEEDUP_PROFILING)
+            log_fatal("control socket send failed: %llu", get_cur_time_us());
             log_error("control socket send normal failed, n=%d, %s",n , strerror(errno));
         }
+        if(SPEEDUP_PROFILING)
+            log_fatal("control socket send end: %llu", get_cur_time_us());
     }
 
     if(server == DNSMASQ || server == DCMQRSCP)
@@ -1347,6 +1383,8 @@ ssize_t write(int fd, const void *buf, size_t count){
         sub_timespec(start, finish, &delta);
         log_info("write (normal) time: %d.%.9ld", (int)delta.tv_sec, delta.tv_nsec);
     }
+    if(SPEEDUP_PROFILING)
+        log_fatal("write end: %llu", get_cur_time_us());
     return my_count;
 }
 
@@ -1404,7 +1442,7 @@ int fcntl(int fd, int cmd, ...){
                 return original_fcntl(fd, cmd, flags);
             default:
                 va_end(ap);
-                log_fatal("fcntl cmd not implement yet");
+                log_error("fcntl cmd not implement yet");
                 exit(999);
         }
     }
@@ -1422,7 +1460,7 @@ int fcntl(int fd, int cmd, ...){
                 return 0;
             default:
                 va_end(ap);
-                log_fatal("fcntl cmd not implement yet");
+                log_error("fcntl cmd not implement yet");
                 exit(999);
         }
     }
@@ -1451,7 +1489,7 @@ int fcntl64(int fd, int cmd, ...){
                 return original_fcntl64(fd, cmd, flags);
             default:
                 va_end(ap);
-                log_fatal("fcntl64 cmd not implement yet");
+                log_error("fcntl64 cmd not implement yet");
                 exit(999);
         }
     }
@@ -1470,7 +1508,7 @@ int fcntl64(int fd, int cmd, ...){
                 return 0;
             default:
                 va_end(ap);
-                log_fatal("fcntl64 cmd not implement yet");
+                log_error("fcntl64 cmd not implement yet");
                 exit(999);
         }
     }
@@ -1542,7 +1580,7 @@ ssize_t recvfrom(int socket, void *restrict buffer, size_t length, int flags, st
             free(m);
         }
         else{
-            log_fatal("not implement socket type in recvfrom!");
+            log_error("not implement socket type in recvfrom!");
             exit(999);
         }
         if(pthread_mutex_unlock(socket_arr[socket].request_lock) != 0) log_error("pthread_mutex_unlock request lock failed");
@@ -1591,7 +1629,7 @@ ssize_t sendto(int socket, const void *message, size_t length, int flags, const 
             count = min(length,MESSAGE_MAX_LENGTH);
     }
     else{
-        log_fatal("not implement socket type in sendto!");
+        log_error("not implement socket type in sendto!");
         exit(999);
     }
     if(pthread_mutex_unlock(socket_arr[socket].response_lock) != 0) log_error("pthread_mutex_unlock response_lock failed");
@@ -1613,7 +1651,7 @@ ssize_t recvmsg(int socket, struct msghdr *message, int flags){
         return original_recvmsg(socket, message, flags);
     else{
         
-        log_fatal("recvmsg not implement this part");
+        log_error("recvmsg not implement this part");
         exit(999);
     }
 }
@@ -1624,7 +1662,7 @@ ssize_t sendmsg(int socket, const struct msghdr *message, int flags){
         return original_sendmsg(socket, message, flags);
     else{
         
-        log_fatal("sendmsg not implement this part");
+        log_error("sendmsg not implement this part");
         exit(999);
     }
 }
@@ -1715,7 +1753,7 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout){
     timer_t current_timer = NULL;
 
     if(server != DNSMASQ && server != DCMQRSCP){
-        log_fatal("not implement yet");
+        log_error("not implement yet");
         exit(999);
     }
 
@@ -1902,6 +1940,7 @@ pid_t fork(void){
     log_trace("hook fork!, pid=%d", getpid());
 
     if(server == DNSMASQ){
+        if(USE_SMART_AFFINITY){
         // change cpu affinity
         cpu_set_t c;
         CPU_ZERO(&c);
@@ -1914,7 +1953,7 @@ pid_t fork(void){
         next_cpu_id = (next_cpu_id + 1) % cpu_count;
         if(next_cpu_id == aflnet_cpu_id)
             next_cpu_id = (next_cpu_id + 1) % cpu_count;
-
+        }
         return original_fork();
     }
     else{
@@ -2085,7 +2124,7 @@ int hook_fd_select(int *hook_nfds, int hook_nfds_len, int hook_bit_count,
                 }
             }
             else if(tmp_except_fd[fd]){
-                log_fatal("except_hook_fd not implement yet");
+                log_error("except_hook_fd not implement yet");
                 return -1;
             }
         }

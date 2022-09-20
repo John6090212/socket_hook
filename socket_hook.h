@@ -54,7 +54,8 @@
 // for logging
 #include "log.h"
 
-#define PROFILING_TIME 1
+#define PROFILING_TIME 0
+#define SPEEDUP_PROFILING 1
 
 enum SERVER_TYPE {DNSMASQ, TINYDTLS, DCMQRSCP, OTHER} server;
 
